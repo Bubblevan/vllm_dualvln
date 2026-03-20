@@ -671,6 +671,116 @@ class BaseRenderer(ABC, Generic[_T]):
         if prompt_embeds.ndim != 2:
             raise ValueError("prompt_embeds must be of shape (seq_len, hidden_size).")
 
+        prompt_token_ids = prompt.get("prompt_token_ids")
+        if prompt_token_ids is not None and len(prompt_token_ids) != prompt_embeds.shape[0]:
+            raise ValueError(
+                "prompt_token_ids and prompt_embeds must have matching lengths. "
+                f"Got prompt_token_ids={len(prompt_token_ids)} "
+                f"prompt_embeds={prompt_embeds.shape[0]}"
+            )
+
+        mm_kwargs = None
+        mm_hashes = None
+        mm_placeholders = None
+        if multi_modal_data := prompt.get("multi_modal_data"):
+            from vllm.multimodal.inputs import PlaceholderRange
+
+            if prompt_token_ids is None:
+                raise ValueError(
+                    "EmbedsPrompt with multi_modal_data requires prompt_token_ids "
+                    "so multimodal placeholders and M-RoPE positions can be built."
+                )
+            mm_inputs = self._process_multimodal(
+                prompt_token_ids,
+                multi_modal_data,
+                mm_processor_kwargs=prompt.get("mm_processor_kwargs"),
+                tokenization_kwargs=None,
+                mm_uuids=prompt.get("multi_modal_uuids"),
+            )
+            mm_kwargs = mm_inputs["mm_kwargs"]
+            mm_hashes = mm_inputs["mm_hashes"]
+            original_mm_placeholders = mm_inputs["mm_placeholders"]
+            processed_prompt_token_ids = mm_inputs["prompt_token_ids"]
+            if len(processed_prompt_token_ids) == prompt_embeds.shape[0]:
+                prompt_token_ids = processed_prompt_token_ids
+                mm_placeholders = original_mm_placeholders
+            else:
+                hf_config = self.model_config.hf_config
+                vision_config = getattr(hf_config, "vision_config", None)
+                spatial_merge_size = getattr(vision_config, "spatial_merge_size", None)
+                image_token_id = getattr(hf_config, "image_token_id", None)
+                video_token_id = getattr(hf_config, "video_token_id", None)
+                if spatial_merge_size is None:
+                    raise ValueError(
+                        "Cannot rebuild multimodal placeholders for EmbedsPrompt "
+                        "because spatial_merge_size is unavailable."
+                    )
+
+                rebuilt_placeholders: dict[str, list[PlaceholderRange]] = {}
+                expected_lengths: dict[str, list[int]] = {}
+
+                def _extract_lengths(modality: str) -> list[int]:
+                    placeholders = original_mm_placeholders.get(modality)
+                    if not placeholders:
+                        return []
+                    return [placeholder.get_num_embeds() for placeholder in placeholders]
+
+                expected_lengths["image"] = _extract_lengths("image")
+                expected_lengths["video"] = _extract_lengths("video")
+                modality_state = {
+                    "image": {"token_id": image_token_id, "index": 0},
+                    "video": {"token_id": video_token_id, "index": 0},
+                }
+
+                idx = 0
+                while idx < len(prompt_token_ids):
+                    matched_modality = None
+                    for modality, state in modality_state.items():
+                        token_id = state["token_id"]
+                        expected = expected_lengths[modality]
+                        item_index = state["index"]
+                        if (
+                            token_id is not None
+                            and item_index < len(expected)
+                            and prompt_token_ids[idx] == token_id
+                        ):
+                            matched_modality = modality
+                            break
+
+                    if matched_modality is None:
+                        idx += 1
+                        continue
+
+                    run_end = idx
+                    token_id = modality_state[matched_modality]["token_id"]
+                    while run_end < len(prompt_token_ids) and prompt_token_ids[run_end] == token_id:
+                        run_end += 1
+                    run_len = run_end - idx
+                    item_index = modality_state[matched_modality]["index"]
+                    expected_len = expected_lengths[matched_modality][item_index]
+                    if run_len != expected_len:
+                        raise ValueError(
+                            "Failed to rebuild multimodal placeholder ranges for "
+                            "EmbedsPrompt because token run length does not match "
+                            f"expected embed length for {matched_modality}[{item_index}]: "
+                            f"run_len={run_len}, expected_len={expected_len}."
+                        )
+                    rebuilt_placeholders.setdefault(matched_modality, []).append(
+                        PlaceholderRange(offset=idx, length=run_len)
+                    )
+                    modality_state[matched_modality]["index"] += 1
+                    idx = run_end
+
+                for modality, expected in expected_lengths.items():
+                    if modality_state[modality]["index"] != len(expected):
+                        raise ValueError(
+                            "Failed to rebuild all multimodal placeholders for "
+                            f"EmbedsPrompt modality={modality}: rebuilt="
+                            f"{modality_state[modality]['index']} expected={len(expected)}."
+                        )
+
+                mm_placeholders = rebuilt_placeholders
+
         # Tensors must be on CPU for serialization between processes
         # in the MsgpackEncoder. Casting to CPU here ensures that there is no
         # hidden device transfer in the critical path of generation.
@@ -678,6 +788,10 @@ class BaseRenderer(ABC, Generic[_T]):
 
         return embeds_inputs(
             prompt_embeds=prompt_embeds,
+            prompt_token_ids=prompt_token_ids,
+            mm_kwargs=mm_kwargs,
+            mm_hashes=mm_hashes,
+            mm_placeholders=mm_placeholders,
             cache_salt=prompt.get("cache_salt"),
         )
 

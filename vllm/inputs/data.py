@@ -81,6 +81,15 @@ class EmbedsPrompt(_PromptOptions):
     prompt_embeds: torch.Tensor
     """The embeddings of the prompt."""
 
+    prompt_token_ids: NotRequired[list[int]]
+    """
+    Optional token IDs corresponding to the embeddings.
+
+    These are useful for models whose position construction depends on
+    token-level metadata (for example M-RoPE in Qwen2.5-VL), even when the
+    backbone input itself is provided via ``prompt_embeds``.
+    """
+
     prompt: NotRequired[str]
     """The prompt text corresponding to the token embeddings, if available."""
 
@@ -234,19 +243,44 @@ class EmbedsInputs(_InputOptions):
     prompt_embeds: torch.Tensor
     """The embeddings of the prompt."""
 
+    prompt_token_ids: NotRequired[list[int]]
+    """Optional token IDs corresponding to the embeddings."""
+
     prompt: NotRequired[str]
     """The prompt text corresponding to the token IDs, if available."""
+
+    mm_kwargs: NotRequired[Any]
+    """Optional multimodal kwargs to be passed through the engine."""
+
+    mm_hashes: NotRequired[Any]
+    """Optional multimodal hashes matching ``mm_kwargs``."""
+
+    mm_placeholders: NotRequired[Any]
+    """Optional multimodal placeholder metadata matching ``mm_kwargs``."""
 
 
 def embeds_inputs(
     prompt_embeds: torch.Tensor,
     *,
+    prompt_token_ids: list[int] | None = None,
+    mm_kwargs: Any | None = None,
+    mm_hashes: Any | None = None,
+    mm_placeholders: Any | None = None,
     prompt: str | None = None,
     cache_salt: str | None = None,
 ) -> EmbedsInputs:
     """Construct [`EmbedsInputs`][vllm.inputs.data.EmbedsInputs] from optional
     values."""
     inputs = EmbedsInputs(type="embeds", prompt_embeds=prompt_embeds)
+
+    if prompt_token_ids is not None:
+        inputs["prompt_token_ids"] = prompt_token_ids
+    if mm_kwargs is not None:
+        inputs["mm_kwargs"] = mm_kwargs
+    if mm_hashes is not None:
+        inputs["mm_hashes"] = mm_hashes
+    if mm_placeholders is not None:
+        inputs["mm_placeholders"] = mm_placeholders
 
     if prompt is not None:
         inputs["prompt"] = prompt

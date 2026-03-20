@@ -8,6 +8,7 @@ from typing import cast
 import numpy as np
 import torch
 
+from vllm.debug_dump import append_log, dump_enabled, save_tensors
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
@@ -334,9 +335,16 @@ class InputBatch:
         end_idx = start_idx + len(request.output_token_ids)
         if request.prompt_token_ids is not None:
             self.token_ids_cpu[req_index, :num_prompt_tokens] = request.prompt_token_ids
-            self.is_token_ids[req_index, :num_prompt_tokens] = True
-        else:
+        # If prompt_embeds are provided for the prompt segment, preserve the
+        # token ids for metadata / position construction, but do not mark these
+        # positions as token-id-backed inputs. Otherwise the worker will
+        # re-embed them and overwrite the supplied prompt embeddings.
+        if request.prompt_embeds is not None:
             self.is_token_ids[req_index, :num_prompt_tokens] = False
+        else:
+            self.is_token_ids[req_index, :num_prompt_tokens] = (
+                request.prompt_token_ids is not None
+            )
         if request.prompt_embeds is not None:
             self.req_prompt_embeds[req_index] = request.prompt_embeds
         self.token_ids_cpu[req_index, start_idx:end_idx] = request.output_token_ids
@@ -346,6 +354,39 @@ class InputBatch:
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
         self.block_table.add_row(request.block_ids, req_index)
+
+        if dump_enabled() and request.prompt_embeds is not None:
+            append_log(
+                "gpu_input_batch_add_request",
+                {
+                    "req_id": req_id,
+                    "req_index": int(req_index),
+                    "num_prompt_tokens": int(num_prompt_tokens),
+                    "has_prompt_token_ids": request.prompt_token_ids is not None,
+                    "has_prompt_embeds": True,
+                    "num_output_token_ids": int(len(request.output_token_ids)),
+                },
+            )
+            prompt_token_ids_tensor = None
+            if request.prompt_token_ids is not None:
+                prompt_token_ids_tensor = torch.tensor(
+                    request.prompt_token_ids, dtype=torch.int64
+                )
+            save_tensors(
+                "gpu_input_batch_add_request",
+                {
+                    "prompt_token_ids": prompt_token_ids_tensor,
+                    "prompt_embeds": request.prompt_embeds,
+                    "is_token_ids_prompt_segment": torch.from_numpy(
+                        self.is_token_ids[req_index, :num_prompt_tokens].copy()
+                    ),
+                },
+                meta={
+                    "req_id": req_id,
+                    "req_index": int(req_index),
+                    "num_prompt_tokens": int(num_prompt_tokens),
+                },
+            )
 
         if sampling_params := request.sampling_params:
             if sampling_params.sampling_type == SamplingType.GREEDY:

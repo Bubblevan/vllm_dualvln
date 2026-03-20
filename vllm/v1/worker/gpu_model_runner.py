@@ -21,6 +21,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
+from vllm.debug_dump import append_log, dump_enabled, save_tensors
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
@@ -2911,6 +2912,39 @@ class GPUModelRunner(
             hidden_states=hidden_states, pooling_metadata=pooling_metadata
         )
 
+        if dump_enabled():
+            append_log(
+                "gpu_model_runner_pooler_output",
+                {
+                    "req_ids": list(self.input_batch.req_ids),
+                    "num_reqs": int(num_reqs),
+                    "output_type": type(raw_pooler_output).__name__,
+                },
+            )
+            if isinstance(raw_pooler_output, list):
+                tensors = {
+                    f"pooler_output_{i}": out
+                    for i, out in enumerate(raw_pooler_output)
+                    if isinstance(out, torch.Tensor)
+                }
+                save_tensors(
+                    "gpu_model_runner_pooler_output",
+                    tensors,
+                    meta={
+                        "req_ids": list(self.input_batch.req_ids),
+                        "num_reqs": int(num_reqs),
+                    },
+                )
+            elif isinstance(raw_pooler_output, torch.Tensor):
+                save_tensors(
+                    "gpu_model_runner_pooler_output",
+                    {"pooler_output": raw_pooler_output},
+                    meta={
+                        "req_ids": list(self.input_batch.req_ids),
+                        "num_reqs": int(num_reqs),
+                    },
+                )
+
         finished_mask = [
             seq_len == prompt_len
             for seq_len, prompt_len in zip(seq_lens_cpu, pooling_metadata.prompt_lens)
@@ -2997,6 +3031,15 @@ class GPUModelRunner(
                 self._execute_mm_encoder(scheduler_output)
                 mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 
+            preserved_prompt_embeds = None
+            preserved_prompt_mask = None
+            if self.enable_prompt_embeds and self.input_batch.req_prompt_embeds:
+                preserved_prompt_mask = ~self.is_token_ids.gpu[:num_scheduled_tokens]
+                if preserved_prompt_mask.any():
+                    preserved_prompt_embeds = self.inputs_embeds.gpu[
+                        :num_scheduled_tokens
+                    ][preserved_prompt_mask].clone()
+
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
@@ -3008,6 +3051,10 @@ class GPUModelRunner(
 
             # TODO(woosuk): Avoid the copy. Optimize.
             self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
+            if preserved_prompt_embeds is not None and preserved_prompt_mask is not None:
+                self.inputs_embeds.gpu[:num_scheduled_tokens][
+                    preserved_prompt_mask
+                ] = preserved_prompt_embeds
 
             input_ids, inputs_embeds = self._prepare_mm_inputs(num_input_tokens)
             model_kwargs = {
@@ -3073,6 +3120,35 @@ class GPUModelRunner(
             # ever have a single encoder input.
             encoder_outputs = self._execute_mm_encoder(scheduler_output)
             model_kwargs.update({"encoder_outputs": encoder_outputs})
+
+        if dump_enabled():
+            num_reqs = self.input_batch.num_reqs
+            save_tensors(
+                "gpu_model_runner_prepare_inputs",
+                {
+                    "input_ids_gpu": self.input_ids.gpu[:num_input_tokens],
+                    "positions_gpu": positions,
+                    "is_token_ids_gpu": (
+                        self.is_token_ids.gpu[:num_input_tokens]
+                        if self.enable_prompt_embeds
+                        else None
+                    ),
+                    "inputs_embeds_gpu": (
+                        self.inputs_embeds.gpu[:num_input_tokens]
+                        if self.enable_prompt_embeds
+                        else None
+                    ),
+                },
+                meta={
+                    "num_input_tokens": int(num_input_tokens),
+                    "num_reqs": int(num_reqs),
+                    "num_scheduled_tokens_per_req": scheduler_output.num_scheduled_tokens,
+                    "req_ids": list(self.input_batch.req_ids),
+                    "uses_mrope": bool(self.uses_mrope),
+                    "supports_mm_inputs": bool(self.supports_mm_inputs),
+                    "enable_prompt_embeds": bool(self.enable_prompt_embeds),
+                },
+            )
 
         return (
             input_ids,
@@ -3811,6 +3887,15 @@ class GPUModelRunner(
                     return hidden_states
 
                 if self.is_pooling_model:
+                    if dump_enabled() and torch.is_tensor(hidden_states):
+                        save_tensors(
+                            "gpu_model_runner_actual_post_forward",
+                            {"hidden_states": hidden_states[:num_scheduled_tokens]},
+                            meta={
+                                "num_scheduled_tokens": int(num_scheduled_tokens),
+                                "req_ids": list(self.input_batch.req_ids),
+                            },
+                        )
                     # Return the pooling output.
                     return self._pool(
                         hidden_states,
@@ -5225,6 +5310,23 @@ class GPUModelRunner(
                     slot_mapping=slot_mappings,
                 ),
             ):
+                if dump_enabled():
+                    save_tensors(
+                        "gpu_model_runner_pre_forward",
+                        {
+                            "input_ids": input_ids,
+                            "inputs_embeds": inputs_embeds,
+                            "positions": positions,
+                        },
+                        meta={
+                            "num_tokens_padded": int(num_tokens_padded),
+                            "num_tokens_unpadded": int(num_tokens_unpadded),
+                            "req_ids": list(self.input_batch.req_ids),
+                            "uses_mrope": bool(self.uses_mrope),
+                            "supports_mm_inputs": bool(self.supports_mm_inputs),
+                            "enable_prompt_embeds": bool(self.enable_prompt_embeds),
+                        },
+                    )
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -5237,6 +5339,18 @@ class GPUModelRunner(
                 hidden_states, _ = outputs
             else:
                 hidden_states = outputs
+
+            if dump_enabled():
+                save_tensors(
+                    "gpu_model_runner_post_forward",
+                    {
+                        "hidden_states": hidden_states,
+                    },
+                    meta={
+                        "num_tokens_padded": int(num_tokens_padded),
+                        "req_ids": list(self.input_batch.req_ids),
+                    },
+                )
 
             if self.speculative_config and (
                 self.speculative_config.use_eagle()
@@ -5486,7 +5600,7 @@ class GPUModelRunner(
 
                 if (encoder_budget := mm_budget.get_encoder_budget()) > 0:
                     if not mm_budget.mm_max_toks_per_item:
-                        # All modality limits are 0 — embedding-only mode.
+                        # All modality limits are 0 鈥? embedding-only mode.
                         # Budget is non-zero for embedding storage, but
                         # there's no encoder to profile.
                         logger.info(
@@ -5676,7 +5790,7 @@ class GPUModelRunner(
 
                 logger.debug(
                     "Estimated %s CUDA graph memory: "
-                    "%.2f MiB first-capture + (%d-1) × %.2f MiB per-graph",
+                    "%.2f MiB first-capture + (%d-1) 脳 %.2f MiB per-graph",
                     mode.name,
                     first_capture / (1 << 20),
                     len(descs),

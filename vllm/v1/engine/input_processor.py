@@ -245,7 +245,7 @@ class InputProcessor:
 
         # Mypy can be conservative for TypedDict unions; normalize access.
         if decoder_inputs["type"] == "embeds":
-            prompt_token_ids = None
+            prompt_token_ids = decoder_inputs.get("prompt_token_ids")
             prompt_embeds = decoder_inputs["prompt_embeds"]
         else:
             prompt_token_ids = decoder_inputs["prompt_token_ids"]
@@ -274,11 +274,31 @@ class InputProcessor:
 
         # Multimodal related.
         mm_features: list[MultiModalFeatureSpec] | None = None
+        decoder_mm_inputs = None
+        decoder_mm_positions = None
+        decoder_mm_hashes = None
 
         if decoder_inputs["type"] == "multimodal":
             decoder_mm_inputs = decoder_inputs["mm_kwargs"]
             decoder_mm_positions = decoder_inputs["mm_placeholders"]
             decoder_mm_hashes = decoder_inputs["mm_hashes"]
+        elif decoder_inputs["type"] == "embeds":
+            decoder_mm_inputs = decoder_inputs.get("mm_kwargs")
+            decoder_mm_positions = decoder_inputs.get("mm_placeholders")
+            decoder_mm_hashes = decoder_inputs.get("mm_hashes")
+
+        if any(
+            value is not None
+            for value in (decoder_mm_inputs, decoder_mm_positions, decoder_mm_hashes)
+        ):
+            if not all(
+                value is not None
+                for value in (decoder_mm_inputs, decoder_mm_positions, decoder_mm_hashes)
+            ):
+                raise ValueError(
+                    "Embeddings-based prompts with multimodal metadata must provide "
+                    "mm_kwargs, mm_placeholders, and mm_hashes together."
+                )
 
             if not all(
                 isinstance(leaf, str) for leaf in json_iter_leaves(decoder_mm_hashes)
@@ -395,10 +415,15 @@ class InputProcessor:
         prompt_len = length_from_prompt_token_ids_or_embeds(prompt_ids, prompt_embeds)
         self._validate_prompt_len(prompt_len, prompt_type)
 
+        mm_positions = None
         if prompt_inputs["type"] == "multimodal":
-            decoder_mm_positions = prompt_inputs["mm_placeholders"]
-            for modality, mm_positions in decoder_mm_positions.items():
-                for mm_position in mm_positions:
+            mm_positions = prompt_inputs["mm_placeholders"]
+        elif prompt_inputs["type"] == "embeds":
+            mm_positions = prompt_inputs.get("mm_placeholders")
+
+        if mm_positions is not None:
+            for modality, modality_positions in mm_positions.items():
+                for mm_position in modality_positions:
                     embed_length = mm_position.get_num_embeds()
                     if embed_length > self.mm_encoder_cache_size:
                         raise ValueError(
