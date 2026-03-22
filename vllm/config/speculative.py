@@ -433,7 +433,7 @@ class SpeculativeConfig:
             )
 
             # ExtractHiddenStatesModel is instantiated manually in load_model()
-            # We just need to store the target model config for KV cache shape info
+            # We just need to store the target model config for KV cache shape info.
             self.model = "extract_hidden_states"
             self.prompt_lookup_max = 0
             self.prompt_lookup_min = 0
@@ -458,19 +458,35 @@ class SpeculativeConfig:
                 **hf_config,
             )
 
-            # Keep target model original typed text_config.
-            # This avoids text_config degrading into a plain dict / generic config.
+            # Preserve the original typed text_config to avoid degenerating into dict / generic config.
             if base_text_config is not base_hf_config:
                 wrapped_hf_config.text_config = copy.deepcopy(base_text_config)
 
             self.draft_model_config.hf_config = wrapped_hf_config
 
-            # Critical: draft side should not continue using transformers backend.
-            # Otherwise it can instantiate the full MM model again and then
-            # hit duplicate attention prefix / layer-name collisions.
+            # Critical: draft side should not continue to use transformers backend.
             self.draft_model_config.model_impl = "auto"
 
-            self.update_arch_()
+            # Critical: do not call self.update_arch_()
+            # It will recalculate the text config / arch from the wrapped config,
+            # which is easy to break the text config / arch.
+            if base_text_config is not base_hf_config:
+                self.draft_model_config.hf_text_config = copy.deepcopy(base_text_config)
+            else:
+                self.draft_model_config.hf_text_config = get_hf_text_config(
+                    self.draft_model_config.hf_config
+                )
+
+            self.draft_model_config.model_arch_config = (
+                self.draft_model_config.get_model_arch_config()
+            )
+            model_info, arch = self.draft_model_config.registry.inspect_model_cls(
+                self.draft_model_config.architectures,
+                self.draft_model_config,
+            )
+            self.draft_model_config._model_info = model_info
+            self.draft_model_config._architecture = arch
+
             self.draft_parallel_config = self.target_parallel_config
 
         else:
