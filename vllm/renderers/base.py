@@ -650,6 +650,39 @@ class BaseRenderer(ABC, Generic[_T]):
 
         return inputs
 
+    from vllm.multimodal import MultiModalKwargsItems
+    from vllm.multimodal.inputs import MultiModalFieldConfig
+
+    def _normalize_explicit_mm_kwargs(self, mm_kwargs: Any):
+        # 已经是处理好的内部结构，直接返回
+        if isinstance(mm_kwargs, MultiModalKwargsItems):
+            return mm_kwargs
+
+        # 支持一种最小 raw 形式：
+        # {"image": [{"image_grid_thw": tensor([t,h,w])}, ...]}
+        if isinstance(mm_kwargs, dict):
+            image_items = mm_kwargs.get("image")
+            if isinstance(image_items, list) and all(
+                isinstance(item, dict) and "image_grid_thw" in item
+                for item in image_items
+            ):
+                image_grid_thw = torch.stack(
+                    [item["image_grid_thw"].long().cpu() for item in image_items],
+                    dim=0,
+                )
+                hf_inputs = {
+                    "image_grid_thw": image_grid_thw,
+                }
+                config_by_key = {
+                    "image_grid_thw": MultiModalFieldConfig.batched("image"),
+                }
+                return MultiModalKwargsItems.from_hf_inputs(hf_inputs, config_by_key)
+
+        raise TypeError(
+            "Unsupported explicit mm_kwargs for EmbedsPrompt. "
+            "Expected MultiModalKwargsItems or raw image_grid_thw items."
+        )
+
     def _process_embeds(
         self,
         prompt: EmbedsPrompt,
@@ -712,7 +745,7 @@ class BaseRenderer(ABC, Generic[_T]):
                     "prompt_token_ids so M-RoPE positions can be built."
                 )
 
-            mm_kwargs = explicit_mm_kwargs
+            mm_kwargs = self._normalize_explicit_mm_kwargs(explicit_mm_kwargs)
             mm_hashes = explicit_mm_hashes
             mm_placeholders = explicit_mm_placeholders
 
