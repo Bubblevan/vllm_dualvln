@@ -447,9 +447,18 @@ class SpeculativeConfig:
                 hf_config = {}
 
             self.draft_model_config = copy.copy(self.target_model_config)
-            self.draft_model_config.hf_config = ExtractHiddenStatesConfig(
-                self.draft_model_config.hf_config, **hf_config
+
+            base_hf_config = self.draft_model_config.hf_config
+            wrapped_hf_config = ExtractHiddenStatesConfig(
+                base_hf_config, **hf_config
             )
+
+            # Keep target model original typed text_config
+            base_text_config = get_hf_text_config(base_hf_config)
+            if base_text_config is not base_hf_config:
+                wrapped_hf_config.text_config = copy.deepcopy(base_text_config)
+
+            self.draft_model_config.hf_config = wrapped_hf_config
             self.update_arch_()
             self.draft_parallel_config = self.target_parallel_config
 

@@ -93,10 +93,10 @@ class EmbedsPrompt(_PromptOptions):
     prompt: NotRequired[str]
     """The prompt text corresponding to the token embeddings, if available."""
 
-    # NEW: explicit passthrough of prebuilt multimodal metadata
     mm_kwargs: NotRequired[Any]
     mm_hashes: NotRequired[Any]
     mm_placeholders: NotRequired[Any]
+    """Explicit passthrough of prebuilt multimodal metadata."""
 
 DecoderOnlyPrompt: TypeAlias = (
     str | TextPrompt | list[int] | TokensPrompt | EmbedsPrompt

@@ -2498,15 +2498,22 @@ class GPUModelRunner(
         mm_lora_refs = list[tuple[str, PlaceholderRange]]()
         for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
             req_state = self.requests[req_id]
-
             for mm_input_id in encoder_input_ids:
                 mm_feature = req_state.mm_features[mm_input_id]
                 if mm_feature.data is None:
                     continue
 
+                pos_info = mm_feature.mm_position
+
+                # Metadata-only multimodal item:
+                # keep it in req_state.mm_features for M-RoPE position construction,
+                # but do not send it through the multimodal encoder again.
+                if pos_info.get_num_embeds() == 0:
+                    continue
+
                 mm_hashes.append(mm_feature.identifier)
                 mm_kwargs.append((mm_feature.modality, mm_feature.data))
-                mm_lora_refs.append((req_id, mm_feature.mm_position))
+                mm_lora_refs.append((req_id, pos_info))
 
         return mm_hashes, mm_kwargs, mm_lora_refs
 

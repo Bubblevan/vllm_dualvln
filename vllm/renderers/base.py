@@ -40,6 +40,10 @@ from .inputs import (
 from .inputs.preprocess import extract_target_prompt
 from .params import ChatParams, TokenizeParams
 
+import torch
+from vllm.multimodal import MultiModalKwargsItems
+from vllm.multimodal.inputs import MultiModalFieldConfig
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.entrypoints.chat_utils import (
@@ -650,8 +654,6 @@ class BaseRenderer(ABC, Generic[_T]):
 
         return inputs
 
-    from vllm.multimodal import MultiModalKwargsItems
-    from vllm.multimodal.inputs import MultiModalFieldConfig
 
     def _normalize_explicit_mm_kwargs(self, mm_kwargs: Any):
         # 已经是处理好的内部结构，直接返回
