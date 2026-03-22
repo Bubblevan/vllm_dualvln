@@ -242,6 +242,7 @@ class ModelRunnerOutput:
 
     # [num_reqs, hidden_size]
     pooler_output: list[torch.Tensor | None] | None = None
+    pooling_hidden_states: list[torch.Tensor | None] | None = None
 
     kv_connector_output: KVConnectorOutput | None = None
 

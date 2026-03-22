@@ -72,14 +72,20 @@ class PoolingOutput:
     """
 
     data: torch.Tensor
+    hidden_states: torch.Tensor | None = None
 
     def __repr__(self) -> str:
-        return f"PoolingOutput(data={self.data})"
+        hidden_states = None if self.hidden_states is None else tuple(self.hidden_states.shape)
+        return f"PoolingOutput(data={self.data}, hidden_states_shape={hidden_states})"
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, self.__class__) and bool(
-            (self.data == other.data).all()
-        )
+        if not isinstance(other, self.__class__):
+            return False
+        if not bool((self.data == other.data).all()):
+            return False
+        if self.hidden_states is None or other.hidden_states is None:
+            return self.hidden_states is None and other.hidden_states is None
+        return bool((self.hidden_states == other.hidden_states).all())
 
 
 class RequestOutput:

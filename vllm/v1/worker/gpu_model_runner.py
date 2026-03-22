@@ -330,11 +330,28 @@ def _copy_pooler_output_to_cpu(
     return pooler_output
 
 
+def _copy_hidden_states_to_cpu(
+    raw_hidden_states: list[torch.Tensor | None], finished_mask: list[bool]
+) -> list[torch.Tensor | None]:
+    if len(raw_hidden_states) != len(finished_mask):
+        raise ValueError(
+            "Raw hidden-state batch size does not match finished mask size: "
+            f"{len(raw_hidden_states)} != {len(finished_mask)}."
+        )
+
+    hidden_states: list[torch.Tensor | None] = [None] * len(finished_mask)
+    for i, (out, include) in enumerate(zip(raw_hidden_states, finished_mask)):
+        if include and out is not None:
+            hidden_states[i] = out.to("cpu", non_blocking=True)
+    return hidden_states
+
+
 class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
         self,
         model_runner_output: ModelRunnerOutput,
         raw_pooler_output: PoolerOutput,
+        raw_hidden_states: list[torch.Tensor | None],
         finished_mask: list[bool],
         async_output_copy_stream: torch.cuda.Stream,
     ):
@@ -346,6 +363,7 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
         # Keep a reference to the device tensors to avoid them being
         # deallocated until we finish copying it to the host.
         self._raw_pooler_output = raw_pooler_output
+        self._raw_hidden_states = raw_hidden_states
 
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = torch.cuda.current_stream()
@@ -353,6 +371,10 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
             async_output_copy_stream.wait_stream(default_stream)
             self._model_runner_output.pooler_output = _copy_pooler_output_to_cpu(
                 raw_pooler_output=self._raw_pooler_output,
+                finished_mask=finished_mask,
+            )
+            self._model_runner_output.pooling_hidden_states = _copy_hidden_states_to_cpu(
+                raw_hidden_states=self._raw_hidden_states,
                 finished_mask=finished_mask,
             )
             self.async_copy_ready_event.record()
@@ -365,6 +387,7 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
 
         # Release the device tensors once the copy has completed.
         del self._raw_pooler_output
+        del self._raw_hidden_states
         return self._model_runner_output
 
 
@@ -2982,6 +3005,21 @@ class GPUModelRunner(
             req_ids=self.input_batch.req_ids,
             finished_mask=finished_mask,
         )
+        raw_hidden_states: list[torch.Tensor | None] = [None] * num_reqs
+        if any(
+            pooling_params is not None and pooling_params.return_raw_hidden_states
+            for pooling_params in pooling_metadata.pooling_params
+        ):
+            cursor = 0
+            for req_index, scheduled_tokens in enumerate(num_scheduled_tokens_np):
+                scheduled_len = int(scheduled_tokens)
+                req_hidden_states = hidden_states[cursor : cursor + scheduled_len]
+                cursor += scheduled_len
+                if (
+                    finished_mask[req_index]
+                    and pooling_metadata.pooling_params[req_index].return_raw_hidden_states
+                ):
+                    raw_hidden_states[req_index] = req_hidden_states
 
         model_runner_output = ModelRunnerOutput(
             req_ids=self.input_batch.req_ids.copy(),
@@ -2991,18 +3029,24 @@ class GPUModelRunner(
 
         if raw_pooler_output is None or not any(finished_mask):
             model_runner_output.pooler_output = [None] * num_reqs
+            model_runner_output.pooling_hidden_states = [None] * num_reqs
             return model_runner_output
 
         if self.use_async_scheduling:
             return AsyncGPUPoolingModelRunnerOutput(
                 model_runner_output=model_runner_output,
                 raw_pooler_output=raw_pooler_output,
+                raw_hidden_states=raw_hidden_states,
                 finished_mask=finished_mask,
                 async_output_copy_stream=self.async_output_copy_stream,
             )
 
         model_runner_output.pooler_output = _copy_pooler_output_to_cpu(
             raw_pooler_output=raw_pooler_output,
+            finished_mask=finished_mask,
+        )
+        model_runner_output.pooling_hidden_states = _copy_hidden_states_to_cpu(
+            raw_hidden_states=raw_hidden_states,
             finished_mask=finished_mask,
         )
         self._sync_device()

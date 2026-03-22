@@ -270,6 +270,7 @@ class RequestState:
         self,
         new_token_ids: list[int],
         pooling_output: torch.Tensor | None,
+        pooling_hidden_states: torch.Tensor | None,
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
@@ -310,7 +311,7 @@ class RequestState:
         if pooling_output is not None:
             return self._new_request_output(
                 external_req_id,
-                [self._new_pooling_output(pooling_output)],
+                [self._new_pooling_output(pooling_output, pooling_hidden_states)],
                 finished,
             )
 
@@ -406,8 +407,15 @@ class RequestState:
             stop_reason=stop_reason if finished else None,
         )
 
-    def _new_pooling_output(self, pooling_output: torch.Tensor) -> PoolingOutput:
-        return PoolingOutput(data=pooling_output)
+    def _new_pooling_output(
+        self,
+        pooling_output: torch.Tensor,
+        pooling_hidden_states: torch.Tensor | None,
+    ) -> PoolingOutput:
+        return PoolingOutput(
+            data=pooling_output,
+            hidden_states=pooling_hidden_states,
+        )
 
 
 class OutputProcessor:
@@ -490,6 +498,7 @@ class OutputProcessor:
                         pooling_output=EMPTY_CPU_TENSOR
                         if req_state.detokenizer is None
                         else None,
+                        pooling_hidden_states=None,
                         finish_reason=FinishReason.ABORT,
                         stop_reason=None,
                         kv_transfer_params=None,
@@ -613,6 +622,7 @@ class OutputProcessor:
 
             new_token_ids = engine_core_output.new_token_ids
             pooling_output = engine_core_output.pooling_output
+            pooling_hidden_states = engine_core_output.pooling_hidden_states
             finish_reason = engine_core_output.finish_reason
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
@@ -639,6 +649,7 @@ class OutputProcessor:
             if request_output := req_state.make_request_output(
                 new_token_ids,
                 pooling_output,
+                pooling_hidden_states,
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,

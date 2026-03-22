@@ -150,6 +150,7 @@ class EngineCoreOutput(
     new_prompt_logprobs_tensors: LogprobsTensors | None = None
 
     pooling_output: torch.Tensor | None = None
+    pooling_hidden_states: torch.Tensor | None = None
 
     finish_reason: FinishReason | None = None
     stop_reason: int | str | None = None
