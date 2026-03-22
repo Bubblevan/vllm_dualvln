@@ -364,7 +364,9 @@ class ExtractHiddenStatesProposer:
 
         with set_model_tag("extract_hidden_states"):
             self.model = get_model(
-                vllm_config=self.vllm_config, model_config=draft_model_config
+                vllm_config=self.vllm_config,
+                model_config=draft_model_config,
+                prefix="extract_hidden_states_draft",
             )
 
         # Identify draft model's attention layers (difference from target)

@@ -423,8 +423,10 @@ class SpeculativeConfig:
             # draft related config as None here.
             self.draft_model_config = self.target_model_config
             self.draft_parallel_config = self.target_parallel_config
+
         elif self.method == "suffix":
             self._validate_suffix_decoding()
+
         elif self.method == "extract_hidden_states":
             from vllm.transformers_utils.configs.extract_hidden_states import (
                 ExtractHiddenStatesConfig,
@@ -449,16 +451,25 @@ class SpeculativeConfig:
             self.draft_model_config = copy.copy(self.target_model_config)
 
             base_hf_config = self.draft_model_config.hf_config
+            base_text_config = get_hf_text_config(base_hf_config)
+
             wrapped_hf_config = ExtractHiddenStatesConfig(
-                base_hf_config, **hf_config
+                base_hf_config,
+                **hf_config,
             )
 
-            # Keep target model original typed text_config
-            base_text_config = get_hf_text_config(base_hf_config)
+            # Keep target model original typed text_config.
+            # This avoids text_config degrading into a plain dict / generic config.
             if base_text_config is not base_hf_config:
                 wrapped_hf_config.text_config = copy.deepcopy(base_text_config)
 
             self.draft_model_config.hf_config = wrapped_hf_config
+
+            # Critical: draft side should not continue using transformers backend.
+            # Otherwise it can instantiate the full MM model again and then
+            # hit duplicate attention prefix / layer-name collisions.
+            self.draft_model_config.model_impl = "auto"
+
             self.update_arch_()
             self.draft_parallel_config = self.target_parallel_config
 
@@ -763,6 +774,38 @@ class SpeculativeConfig:
 
         return draft_parallel_config
 
+    @staticmethod
+    def _cfg_model_type(cfg) -> str:
+        if cfg is None:
+            return ""
+        if isinstance(cfg, dict):
+            return str(cfg.get("model_type", "") or "")
+        return str(getattr(cfg, "model_type", "") or "")
+
+    def _effective_aux_hidden_state_model_type(self) -> str:
+        if self.target_model_config is None:
+            return ""
+
+        hf_cfg = getattr(self.target_model_config, "hf_config", None)
+        hf_text_cfg = getattr(self.target_model_config, "hf_text_config", None)
+        nested_text_cfg = getattr(hf_cfg, "text_config", None)
+
+        candidates = [
+            self._cfg_model_type(hf_text_cfg),
+            self._cfg_model_type(nested_text_cfg),
+            self._cfg_model_type(hf_cfg),
+        ]
+
+        # Wrapper model prioritizes falling back to the real text backbone.
+        for mt in candidates:
+            if "qwen" in mt:
+                return mt
+        for mt in candidates:
+            if mt:
+                return mt
+        return ""
+
+
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
         if self.tensor_parallel_size is not None:
@@ -803,18 +846,25 @@ class SpeculativeConfig:
             "kimi_k2",
             "kimi_k25",
         ]
+
+        effective_mt = self._effective_aux_hidden_state_model_type()
+
         if (
             self.method in ("eagle3", "extract_hidden_states")
             and self.target_model_config
             and not any(
-                supported_model in self.target_model_config.hf_text_config.model_type
+                supported_model in effective_mt
                 for supported_model in aux_hidden_states_supported
             )
         ):
             raise ValueError(
-                f"{self.method} is only supported for {aux_hidden_states_supported}"
-                f" models. Got {self.target_model_config.hf_text_config.model_type=}"
+                f"{self.method} is only supported for "
+                f"{aux_hidden_states_supported} models. "
+                f"Got effective_model_type={effective_mt!r}, "
+                f"hf_text_config.model_type="
+                f"{getattr(self.target_model_config.hf_text_config, 'model_type', None)!r}"
             )
+
         self.verify_equal_vocab_size_if_draft_model()
         return self
 
