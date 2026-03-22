@@ -49,17 +49,26 @@ class BaseModelLoader(ABC):
             device_config.device if load_config.device is None else load_config.device
         )
         target_device = torch.device(load_device)
+        logger.info(
+            "Model loader start: model=%s load_device=%s dtype=%s",
+            model_config.model,
+            load_device,
+            model_config.dtype,
+        )
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
+                logger.info("Model loader: initialize_model() begin")
                 model = initialize_model(
                     vllm_config=vllm_config, model_config=model_config, prefix=prefix
                 )
+                logger.info("Model loader: initialize_model() done")
 
             log_model_inspection(model)
 
-            logger.debug("Loading weights on %s ...", load_device)
+            logger.info("Model loader: load_weights() begin on %s", load_device)
             # Quantization does not happen in `load_weights` but after it
             self.load_weights(model, model_config)
+            logger.info("Model loader: load_weights() done")
 
             # Log peak GPU memory after loading weights. This is needed
             # to have test coverage on peak memory for online quantization.
@@ -71,7 +80,9 @@ class BaseModelLoader(ABC):
                     scope="local",
                 )
 
+            logger.info("Model loader: process_weights_after_loading() begin")
             process_weights_after_loading(model, model_config, target_device)
+            logger.info("Model loader: process_weights_after_loading() done")
 
         return model.eval()
 

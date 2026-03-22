@@ -482,6 +482,10 @@ _MULTIMODAL_MODELS = {
         "qwen2_5_vl",
         "Qwen2_5_VLForConditionalGeneration",
     ),
+    "InternVLAN1ForCausalLM": (
+        "qwen2_5_vl",
+        "InternVLAN1ForCausalLM",
+    ),
     "Qwen2AudioForConditionalGeneration": (
         "qwen2_audio",
         "Qwen2AudioForConditionalGeneration",

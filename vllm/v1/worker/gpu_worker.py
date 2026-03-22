@@ -252,14 +252,19 @@ class Worker(WorkerBase):
                 )
 
             self.device = torch.device(f"cuda:{self.local_rank}")
+            logger.info("Worker init_device: set_device(%s) begin", self.device)
             current_platform.set_device(self.device)
+            logger.info("Worker init_device: set_device(%s) done", self.device)
 
+            logger.info("Worker init_device: check_if_supports_dtype(%s) begin", self.model_config.dtype)
             current_platform.check_if_supports_dtype(self.model_config.dtype)
+            logger.info("Worker init_device: check_if_supports_dtype(%s) done", self.model_config.dtype)
 
             # Initialize the distributed environment BEFORE taking
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
             # available memory
+            logger.info("Worker init_device: distributed init begin")
             init_worker_distributed_environment(
                 self.vllm_config,
                 self.rank,
@@ -267,19 +272,28 @@ class Worker(WorkerBase):
                 self.local_rank,
                 current_platform.dist_backend,
             )
+            logger.info("Worker init_device: distributed init done")
 
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner", scope="local")
 
             # Set random seed.
+            logger.info("Worker init_device: set_random_seed(%s) begin", self.model_config.seed)
             set_random_seed(self.model_config.seed)
+            logger.info("Worker init_device: set_random_seed(%s) done", self.model_config.seed)
 
             # Now take memory snapshot after NCCL is initialized
+            logger.info("Worker init_device: gc.collect() begin")
             gc.collect()
+            logger.info("Worker init_device: gc.collect() done")
+            logger.info("Worker init_device: torch.accelerator.empty_cache() begin")
             torch.accelerator.empty_cache()
+            logger.info("Worker init_device: torch.accelerator.empty_cache() done")
 
             # take current memory snapshot
+            logger.info("Worker init_device: MemorySnapshot(%s) begin", self.device)
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
+            logger.info("Worker init_device: MemorySnapshot(%s) done", self.device)
             self.requested_memory = request_memory(init_snapshot, self.cache_config)
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug(
@@ -290,7 +304,13 @@ class Worker(WorkerBase):
 
         # Initialize workspace manager
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
+        logger.info(
+            "Worker init_device: init_workspace_manager(device=%s, num_ubatches=%s) begin",
+            self.device,
+            num_ubatches,
+        )
         init_workspace_manager(self.device, num_ubatches)
+        logger.info("Worker init_device: init_workspace_manager() done")
 
         # Construct the model runner
         if self.use_v2_model_runner:
@@ -299,15 +319,19 @@ class Worker(WorkerBase):
             )
 
             # HACK(woosuk): This is a temporary fix to avoid type errors.
+            logger.info("Worker init_device: GPUModelRunnerV2() begin")
             self.model_runner: GPUModelRunner = GPUModelRunnerV2(  # type: ignore
                 self.vllm_config, self.device
             )
+            logger.info("Worker init_device: GPUModelRunnerV2() done")
         else:
             from vllm.v1.worker.gpu_model_runner import (
                 GPUModelRunner as GPUModelRunnerV1,
             )
 
+            logger.info("Worker init_device: GPUModelRunnerV1() begin")
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+            logger.info("Worker init_device: GPUModelRunnerV1() done")
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

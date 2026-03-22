@@ -392,6 +392,7 @@ class GPUModelRunner(
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        logger.info("GPUModelRunner.__init__: begin")
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -411,6 +412,7 @@ class GPUModelRunner(
         self.device = device
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
+        logger.info("GPUModelRunner.__init__: basic config captured")
 
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             cache_config.cache_dtype, self.model_config
@@ -474,6 +476,7 @@ class GPUModelRunner(
 
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+        logger.info("GPUModelRunner.__init__: sampler initialized")
 
         self.eplb_state: EplbState | None = None
         # NOTE(yongji): flag to temporarily disable EPLB during scaling up/down
@@ -564,6 +567,7 @@ class GPUModelRunner(
                     f"{self.speculative_config.method}"
                 )
             self.rejection_sampler = RejectionSampler(self.sampler)
+        logger.info("GPUModelRunner.__init__: speculative setup done")
 
         self.num_spec_tokens = 0
         if self.speculative_config:
@@ -580,6 +584,7 @@ class GPUModelRunner(
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
         self.comm_stream = torch.cuda.Stream()
+        logger.info("GPUModelRunner.__init__: comm_stream created")
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -624,6 +629,7 @@ class GPUModelRunner(
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
+        logger.info("GPUModelRunner.__init__: input_batch created")
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
         # GPU to CPU when async scheduling is enabled.
@@ -634,6 +640,7 @@ class GPUModelRunner(
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
             self.prepare_inputs_event = torch.Event()
+        logger.info("GPUModelRunner.__init__: async scheduling buffers done")
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
@@ -648,6 +655,7 @@ class GPUModelRunner(
 
         # Cache the device properties.
         self._init_device_properties()
+        logger.info("GPUModelRunner.__init__: device properties initialized")
 
         # Encoder timing registry for observability
         self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}
@@ -681,6 +689,7 @@ class GPUModelRunner(
         self.num_accepted_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int64
         )
+        logger.info("GPUModelRunner.__init__: core persistent buffers allocated")
 
         # Only relevant for multimodal models
         if self.supports_mm_inputs:
@@ -707,6 +716,7 @@ class GPUModelRunner(
             self.mrope_positions = self._make_buffer(
                 (3, self.max_num_tokens + 1), dtype=torch.int64
             )
+            logger.info("GPUModelRunner.__init__: mrope buffer allocated")
 
         # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
         if self.uses_xdrope_dim > 0:
@@ -714,6 +724,7 @@ class GPUModelRunner(
             self.xdrope_positions = self._make_buffer(
                 (self.uses_xdrope_dim, self.max_num_tokens + 1), dtype=torch.int64
             )
+            logger.info("GPUModelRunner.__init__: xdrope buffer allocated")
 
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: IntermediateTensors | None = None
@@ -737,6 +748,7 @@ class GPUModelRunner(
             self.kv_sharing_fast_prefill_logits_indices = torch.zeros(
                 self.max_num_tokens, dtype=torch.int32, device=self.device
             )
+        logger.info("GPUModelRunner.__init__: kv sharing setup done")
 
         self.uniform_decode_query_len = 1 + self.num_spec_tokens
 
@@ -816,6 +828,7 @@ class GPUModelRunner(
         # Model weight offloader
         # Make sure this is called before any get_offloader call
         set_offloader(create_offloader(self.offload_config))
+        logger.info("GPUModelRunner.__init__: offloader initialized")
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
@@ -823,6 +836,7 @@ class GPUModelRunner(
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
         self.layerwise_nvtx_hooks_registered = False
+        logger.info("GPUModelRunner.__init__: done")
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -910,6 +924,12 @@ class GPUModelRunner(
     def _make_buffer(
         self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True
     ) -> CpuGpuBuffer:
+        logger.info(
+            "GPUModelRunner._make_buffer: size=%s dtype=%s numpy=%s",
+            size,
+            dtype,
+            numpy,
+        )
         return CpuGpuBuffer(
             *size,
             dtype=dtype,

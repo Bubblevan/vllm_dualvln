@@ -37,6 +37,19 @@ class ExtractHiddenStatesConfig(PretrainedConfig):
 
         super().__init__(**combined)
 
+    def get_text_config(self, decoder: bool = False):
+        text_config = getattr(self, "text_config", None)
+        if isinstance(text_config, PretrainedConfig):
+            return text_config
+
+        # Some multimodal configs arrive here through to_dict(), which turns
+        # the nested text config into a plain dict. In that case the top-level
+        # config still carries the language-model shape attributes we need.
+        if isinstance(text_config, dict) and hasattr(self, "num_attention_heads"):
+            return self
+
+        return super().get_text_config(decoder=decoder)
+
     @classmethod
     def from_pretrained(
         cls,

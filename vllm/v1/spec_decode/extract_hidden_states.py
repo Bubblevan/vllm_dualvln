@@ -157,9 +157,20 @@ class ExtractHiddenStatesProposer:
                 hidden_states=self.hidden_states[:num_input_tokens],
             )
 
-        # Return the sampled tokens as "draft" tokens
-        # Shape: [batch_size, 1] to match num_speculative_tokens=1
-        return sampled_token_ids.unsqueeze(-1), kv_connector_output
+        # Return the sampled tokens as "draft" tokens.
+        # Older call sites may pass [batch_size], while newer ones already pass
+        # [batch_size, 1] for num_speculative_tokens=1.
+        if sampled_token_ids.ndim == 1:
+            draft_token_ids = sampled_token_ids.unsqueeze(-1)
+        elif sampled_token_ids.ndim == 2 and sampled_token_ids.shape[1] == 1:
+            draft_token_ids = sampled_token_ids
+        else:
+            raise ValueError(
+                f"Unexpected sampled_token_ids shape for extract_hidden_states: "
+                f"{tuple(sampled_token_ids.shape)}"
+            )
+
+        return draft_token_ids, kv_connector_output
 
     def _get_slot_mapping(
         self,

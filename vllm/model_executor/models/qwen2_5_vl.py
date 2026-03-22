@@ -1519,3 +1519,30 @@ class Qwen2_5_VLForConditionalGeneration(
         vision_config = hf_config.vision_config
         merge_size = vision_config.spatial_merge_size
         return num_vision_tokens // merge_size**2
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    Qwen2_5_VLMultiModalProcessor,
+    info=Qwen2_5_VLProcessingInfo,
+    dummy_inputs=Qwen2_5_VLDummyInputsBuilder,
+)
+class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration):
+    """InternVLA-N1 checkpoint adapter backed by native Qwen2.5-VL execution."""
+
+    _extra_unexpected_prefixes = [
+        "model.action_decoder.",
+        "model.action_encoder.",
+        "model.cond_projector.",
+        "model.latent_queries",
+        "model.memory_encoder.",
+        "model.rgb_model.",
+        "model.rgb_resampler.",
+        "model.traj_dit.",
+    ]
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(
+            self,
+            ignore_unexpected_prefixes=self._extra_unexpected_prefixes,
+        )
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
