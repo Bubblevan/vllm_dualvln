@@ -788,11 +788,24 @@ class SpeculativeConfig:
 
         hf_cfg = getattr(self.target_model_config, "hf_config", None)
         hf_text_cfg = getattr(self.target_model_config, "hf_text_config", None)
-        nested_text_cfg = getattr(hf_cfg, "text_config", None)
+        nested_text_attr = getattr(hf_cfg, "text_config", None)
+
+        nested_text_dict = None
+        if hf_cfg is not None and hasattr(hf_cfg, "to_dict"):
+            try:
+                hf_cfg_dict = hf_cfg.to_dict()
+                nested_text_dict = hf_cfg_dict.get("text_config", None)
+            except Exception:
+                nested_text_dict = None
 
         candidates = [
+            # Most reliable: text_config serialized from root hf_config
+            self._cfg_model_type(nested_text_dict),
+            # Secondly: text_config in attribute form
+            self._cfg_model_type(nested_text_attr),
+            # Thirdly: hf_text_config cached in ModelConfig
             self._cfg_model_type(hf_text_cfg),
-            self._cfg_model_type(nested_text_cfg),
+            # Finally: root model_type
             self._cfg_model_type(hf_cfg),
         ]
 
@@ -804,7 +817,6 @@ class SpeculativeConfig:
             if mt:
                 return mt
         return ""
-
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
