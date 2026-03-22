@@ -183,6 +183,10 @@ class Base(
                 trust_remote_code=self.model_config.trust_remote_code,
             )
 
+        extra_ignore_prefixes = getattr(self.model, "_vllm_ignore_unexpected_prefixes", None)
+        if extra_ignore_prefixes:
+            self.ignore_unexpected_prefixes.extend(extra_ignore_prefixes)
+
         # Remove layers not on this pipeline parallel rank
         self.pipeline_parallel()
         # Substitute remaining layers with vLLM's layers as needed

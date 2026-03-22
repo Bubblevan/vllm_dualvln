@@ -661,10 +661,6 @@ class BaseRenderer(ABC, Generic[_T]):
 
         prompt_embeds = prompt["prompt_embeds"]
 
-        # prompt_embeds must be (seq_len, hidden_size), but if the user
-        # passes in a batch of size 1, i.e. (1, seq_len, hidden_size),
-        # we can unambiguously process the intent by squeezing the batch
-        # dimension.
         if prompt_embeds.ndim == 3:
             prompt_embeds = prompt_embeds.squeeze(dim=0)
 
@@ -679,10 +675,48 @@ class BaseRenderer(ABC, Generic[_T]):
                 f"prompt_embeds={prompt_embeds.shape[0]}"
             )
 
+        # --- NEW: explicit passthrough support for prebuilt multimodal metadata ---
+        explicit_mm_kwargs = prompt.get("mm_kwargs")
+        explicit_mm_hashes = prompt.get("mm_hashes")
+        explicit_mm_placeholders = prompt.get("mm_placeholders")
+
         mm_kwargs = None
         mm_hashes = None
         mm_placeholders = None
-        if multi_modal_data := prompt.get("multi_modal_data"):
+
+        has_explicit_mm = any(
+            x is not None
+            for x in (explicit_mm_kwargs, explicit_mm_hashes, explicit_mm_placeholders)
+        )
+        has_raw_mm = prompt.get("multi_modal_data") is not None
+
+        if has_explicit_mm and has_raw_mm:
+            raise ValueError(
+                "EmbedsPrompt must provide either prebuilt multimodal metadata "
+                "(mm_kwargs/mm_hashes/mm_placeholders) or multi_modal_data, not both."
+            )
+
+        if has_explicit_mm:
+            if not all(
+                x is not None
+                for x in (explicit_mm_kwargs, explicit_mm_hashes, explicit_mm_placeholders)
+            ):
+                raise ValueError(
+                    "EmbedsPrompt with explicit multimodal metadata must provide "
+                    "mm_kwargs, mm_hashes, and mm_placeholders together."
+                )
+
+            if prompt_token_ids is None:
+                raise ValueError(
+                    "EmbedsPrompt with explicit multimodal metadata requires "
+                    "prompt_token_ids so M-RoPE positions can be built."
+                )
+
+            mm_kwargs = explicit_mm_kwargs
+            mm_hashes = explicit_mm_hashes
+            mm_placeholders = explicit_mm_placeholders
+
+        elif multi_modal_data := prompt.get("multi_modal_data"):
             from vllm.multimodal.inputs import PlaceholderRange
 
             if prompt_token_ids is None:
@@ -690,6 +724,7 @@ class BaseRenderer(ABC, Generic[_T]):
                     "EmbedsPrompt with multi_modal_data requires prompt_token_ids "
                     "so multimodal placeholders and M-RoPE positions can be built."
                 )
+
             mm_inputs = self._process_multimodal(
                 prompt_token_ids,
                 multi_modal_data,
@@ -701,6 +736,7 @@ class BaseRenderer(ABC, Generic[_T]):
             mm_hashes = mm_inputs["mm_hashes"]
             original_mm_placeholders = mm_inputs["mm_placeholders"]
             processed_prompt_token_ids = mm_inputs["prompt_token_ids"]
+
             if len(processed_prompt_token_ids) == prompt_embeds.shape[0]:
                 prompt_token_ids = processed_prompt_token_ids
                 mm_placeholders = original_mm_placeholders
@@ -755,6 +791,7 @@ class BaseRenderer(ABC, Generic[_T]):
                     token_id = modality_state[matched_modality]["token_id"]
                     while run_end < len(prompt_token_ids) and prompt_token_ids[run_end] == token_id:
                         run_end += 1
+
                     run_len = run_end - idx
                     item_index = modality_state[matched_modality]["index"]
                     expected_len = expected_lengths[matched_modality][item_index]
@@ -765,6 +802,7 @@ class BaseRenderer(ABC, Generic[_T]):
                             f"expected embed length for {matched_modality}[{item_index}]: "
                             f"run_len={run_len}, expected_len={expected_len}."
                         )
+
                     rebuilt_placeholders.setdefault(matched_modality, []).append(
                         PlaceholderRange(offset=idx, length=run_len)
                     )
@@ -781,9 +819,6 @@ class BaseRenderer(ABC, Generic[_T]):
 
                 mm_placeholders = rebuilt_placeholders
 
-        # Tensors must be on CPU for serialization between processes
-        # in the MsgpackEncoder. Casting to CPU here ensures that there is no
-        # hidden device transfer in the critical path of generation.
         prompt_embeds = prompt_embeds.cpu()
 
         return embeds_inputs(
