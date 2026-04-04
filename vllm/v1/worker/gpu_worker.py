@@ -747,6 +747,50 @@ class Worker(WorkerBase):
         """Get encoder timing stats from model runner."""
         return self.model_runner.get_encoder_timing_stats()
 
+    def get_internnav_runtime_stats(self) -> dict[str, int | float | None]:
+        available_kv_cache_memory_bytes = getattr(
+            self,
+            "available_kv_cache_memory_bytes",
+            None,
+        )
+        requested_memory = getattr(self, "requested_memory", None)
+        peak_activation_memory = getattr(self, "peak_activation_memory", None)
+        cudagraph_memory_estimate = getattr(
+            self,
+            "cudagraph_memory_estimate",
+            None,
+        )
+        num_gpu_blocks = getattr(self.cache_config, "num_gpu_blocks", None)
+
+        return {
+            "available_kv_cache_memory_bytes": (
+                int(available_kv_cache_memory_bytes)
+                if available_kv_cache_memory_bytes is not None
+                else None
+            ),
+            "requested_memory_bytes": (
+                int(requested_memory) if requested_memory is not None else None
+            ),
+            "peak_activation_memory_bytes": (
+                int(peak_activation_memory)
+                if peak_activation_memory is not None
+                else None
+            ),
+            "cudagraph_memory_estimate_bytes": (
+                int(cudagraph_memory_estimate)
+                if cudagraph_memory_estimate is not None
+                else None
+            ),
+            "effective_kv_budget_bytes": (
+                int(available_kv_cache_memory_bytes)
+                if available_kv_cache_memory_bytes is not None
+                else None
+            ),
+            "gpu_memory_utilization": float(self.cache_config.gpu_memory_utilization),
+            "max_model_len": int(self.model_config.max_model_len),
+            "num_gpu_blocks": int(num_gpu_blocks) if num_gpu_blocks is not None else None,
+        }
+
     def annotate_profile(self, scheduler_output):
         # add trace annotation so that we can easily distinguish
         # context/generation request numbers in each iteration.

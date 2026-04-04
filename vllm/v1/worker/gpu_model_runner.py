@@ -3725,7 +3725,7 @@ class GPUModelRunner(
 
             return hidden_states[
                 num_scheduled_tokens - n_query : num_scheduled_tokens
-            ].detach().cpu()
+            ].detach().cpu().unsqueeze(0)
         finally:
             self._cleanup_after_native_latent_prefill(req_id)
 

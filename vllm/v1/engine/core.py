@@ -737,6 +737,28 @@ class EngineCore:
     ) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
 
+    def _drain_finished_requests_for_native_prefill(self) -> None:
+        # 还有真正活着的请求时，仍然不允许插入 native latent prefill
+        if self.scheduler.has_unfinished_requests():
+            raise RuntimeError(
+                "generate_latents_native_prefill requires no unfinished requests; "
+                "the engine still has active generation work."
+            )
+
+        # 这里只清理 finished-but-not-yet-removed 的残留
+        for _ in range(8):
+            if not self.scheduler.has_requests():
+                return
+
+            outputs, model_executed = self.step_fn()
+            self.post_step(model_executed)
+
+        if self.scheduler.has_requests():
+            raise RuntimeError(
+                "generate_latents_native_prefill could not drain finished requests "
+                "to an idle engine state."
+            )
+
     def generate_latents_native_prefill(
         self,
         prompt_token_ids: list[int],
@@ -745,6 +767,9 @@ class EngineCore:
         n_query: int,
         prompt_embeds_soft_suffix_len: int | None = None,
     ) -> list[Any]:
+        if self.scheduler.has_requests():
+            self._drain_finished_requests_for_native_prefill()
+
         if self.scheduler.has_requests():
             raise RuntimeError(
                 "generate_latents_native_prefill requires the engine to be idle."
