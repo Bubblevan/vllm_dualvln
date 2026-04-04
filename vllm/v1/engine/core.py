@@ -764,8 +764,6 @@ class EngineCore:
         else:
             prompt_embeds = prompt_embeds.detach().cpu()
         mm_features = list(mm_features or [])
-        if self.mm_receiver_cache is not None and mm_features:
-            mm_features = self.mm_receiver_cache.get_and_update_features(mm_features)
         if len(prompt_token_ids) == 0:
             raise ValueError("prompt_token_ids must be non-empty.")
         if prompt_embeds.ndim != 2:
@@ -779,7 +777,7 @@ class EngineCore:
                 f"{int(prompt_embeds.shape[0])} != {len(prompt_token_ids)}."
             )
 
-        request = Request(
+        engine_request = EngineCoreRequest(
             request_id=f"latent_prefill_{time.time_ns()}",
             prompt_token_ids=list(prompt_token_ids),
             prompt_embeds=prompt_embeds.detach().cpu().contiguous(),
@@ -787,49 +785,21 @@ class EngineCore:
             sampling_params=SamplingParams(
                 max_tokens=1,
                 temperature=0.0,
-                skip_reading_prefix_cache=True,
             ),
             pooling_params=None,
             arrival_time=time.time(),
-            block_hasher=None,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
         )
-
-        self.scheduler.kv_cache_manager.new_step_starts()
-        new_blocks = self.scheduler.kv_cache_manager.allocate_slots(
-            request,
-            num_new_tokens=request.num_tokens,
-            delay_cache_blocks=True,
-        )
-        if new_blocks is None:
+        request, request_wave = self.preprocess_add_request(engine_request)
+        self.add_request(request, request_wave)
+        scheduler_output = self.scheduler.schedule()
+        if request.request_id not in scheduler_output.num_scheduled_tokens:
             raise RuntimeError(
-                "Failed to allocate KV cache blocks for native latent prefill."
+                "Native latent prefill request was not scheduled by the normal "
+                "scheduler path."
             )
-
-        new_block_ids_to_zero = (
-            (self.scheduler.kv_cache_manager.take_new_block_ids() or None)
-            if self.scheduler.needs_kv_cache_zeroing
-            else None
-        )
-        scheduler_output = SchedulerOutput(
-            scheduled_new_reqs=[
-                NewRequestData.from_request(
-                    request,
-                    new_blocks.get_block_ids(),
-                )
-            ],
-            scheduled_cached_reqs=CachedRequestData.make_empty(),
-            num_scheduled_tokens={request.request_id: request.num_tokens},
-            total_num_scheduled_tokens=request.num_tokens,
-            scheduled_spec_decode_tokens={},
-            scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[
-                0 for _ in self.scheduler.kv_cache_config.kv_cache_groups
-            ],
-            finished_req_ids=set(),
-            free_encoder_mm_hashes=[],
-            preempted_req_ids=set(),
-            new_block_ids_to_zero=new_block_ids_to_zero,
-        )
 
         try:
             return self.model_executor.collective_rpc(
@@ -837,7 +807,14 @@ class EngineCore:
                 args=(scheduler_output, n_query),
             )
         finally:
-            self.scheduler.kv_cache_manager.free(request)
+            self.scheduler.finish_requests(
+                request.request_id,
+                RequestStatus.FINISHED_ABORTED,
+            )
+            # The worker-side native-prefill helper performs its own request
+            # cleanup, so do not leak this synthetic utility request into the
+            # next normal scheduler step.
+            self.scheduler.finished_req_ids = set()
 
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.
