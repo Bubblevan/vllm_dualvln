@@ -599,6 +599,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Dump fx graphs to the given directory.
     # It will override CompilationConfig.debug_dump_path if set.
     "VLLM_DEBUG_DUMP_PATH": lambda: os.environ.get("VLLM_DEBUG_DUMP_PATH", None),
+    # Lightweight runtime tensor/log dumps used by local debugging helpers.
+    "VLLM_DEBUG_DUMP_DIR": lambda: os.environ.get("VLLM_DEBUG_DUMP_DIR", None),
+    "VLLM_DEBUG_DUMP_PREFIX": lambda: os.environ.get("VLLM_DEBUG_DUMP_PREFIX", None),
+    "VLLM_DEBUG_DUMP_FULL_TENSORS": lambda: os.environ.get(
+        "VLLM_DEBUG_DUMP_FULL_TENSORS", "0"
+    )
+    == "1",
+    "VLLM_DEBUG_DUMP_SLICE_ROWS": lambda: int(
+        os.environ.get("VLLM_DEBUG_DUMP_SLICE_ROWS", "8")
+    ),
     # Feature flag to enable/disable AOT compilation. This will ensure
     # compilation is done in warmup phase and the compilation will be
     # reused in subsequent calls.
@@ -1725,6 +1735,10 @@ def compile_factors() -> dict[str, object]:
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
         "VLLM_DEBUG_DUMP_PATH",
+        "VLLM_DEBUG_DUMP_DIR",
+        "VLLM_DEBUG_DUMP_PREFIX",
+        "VLLM_DEBUG_DUMP_FULL_TENSORS",
+        "VLLM_DEBUG_DUMP_SLICE_ROWS",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
         "LD_LIBRARY_PATH",

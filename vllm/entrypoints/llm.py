@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import cloudpickle
+import torch
 import torch.nn as nn
 from pydantic import ValidationError
 from tqdm.auto import tqdm
@@ -675,6 +676,25 @@ class LLM:
             VRAM!
         """
         return self.llm_engine.apply_model(func)
+
+    def generate_latents_native_prefill(
+        self,
+        *,
+        prompt_token_ids: list[int],
+        prompt_embeds,
+        mm_features,
+        n_query: int,
+    ) -> list[torch.Tensor]:
+        """
+        Run a batch=1 native-context prefill on the current generate engine and
+        return the last `n_query` hidden states from each worker.
+        """
+        return self.llm_engine.generate_latents_native_prefill(
+            prompt_token_ids=prompt_token_ids,
+            prompt_embeds=prompt_embeds,
+            mm_features=mm_features,
+            n_query=n_query,
+        )
 
     def beam_search(
         self,

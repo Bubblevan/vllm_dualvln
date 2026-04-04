@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import pickle
 import contextlib
 import multiprocessing
 import queue
@@ -16,6 +17,7 @@ from threading import Thread
 from typing import Any, TypeAlias, TypeVar
 
 import msgspec.msgpack
+import torch
 import zmq
 import zmq.asyncio
 
@@ -197,6 +199,15 @@ class EngineCoreClient(ABC):
     ) -> list[_R]:
         raise NotImplementedError
 
+    def generate_latents_native_prefill(
+        self,
+        prompt_token_ids: list[int],
+        prompt_embeds,
+        mm_features,
+        n_query: int,
+    ) -> list[Any]:
+        raise NotImplementedError
+
     def dp_engines_running(self) -> bool:
         """Returns True if data parallel engines are collectively in a
         running state."""
@@ -357,6 +368,20 @@ class InprocClient(EngineCoreClient):
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
+
+    def generate_latents_native_prefill(
+        self,
+        prompt_token_ids: list[int],
+        prompt_embeds,
+        mm_features,
+        n_query: int,
+    ) -> list[Any]:
+        return self.engine_core.generate_latents_native_prefill(
+            prompt_token_ids=prompt_token_ids,
+            prompt_embeds=prompt_embeds,
+            mm_features=mm_features,
+            n_query=n_query,
+        )
 
     def dp_engines_running(self) -> bool:
         return False
@@ -702,6 +727,18 @@ class MPClient(EngineCoreClient):
             target=monitor_engine_cores, daemon=True, name="MPClientEngineMonitor"
         ).start()
 
+    def generate_latents_native_prefill(
+        self,
+        prompt_token_ids: list[int],
+        prompt_embeds,
+        mm_features,
+        n_query: int,
+    ) -> list[Any]:
+        raise NotImplementedError(
+            "generate_latents_native_prefill is only available on the "
+            "synchronous LLM client."
+        )
+
 
 def _process_utility_output(
     output: UtilityOutput, utility_results: dict[int, AnyFuture]
@@ -889,6 +926,31 @@ class SyncMPClient(MPClient):
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
         return self.call_utility("collective_rpc", method, timeout, args, kwargs)
+
+    def generate_latents_native_prefill(
+        self,
+        prompt_token_ids: list[int],
+        prompt_embeds,
+        mm_features,
+        n_query: int,
+    ) -> list[Any]:
+        if torch.is_tensor(prompt_embeds):
+            prompt_embeds = pickle.dumps(
+                prompt_embeds.detach().cpu().contiguous(),
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+        if mm_features is not None:
+            mm_features = pickle.dumps(
+                mm_features,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+        return self.call_utility(
+            "generate_latents_native_prefill",
+            prompt_token_ids,
+            prompt_embeds,
+            mm_features,
+            n_query,
+        )
 
     def save_sharded_state(
         self, path: str, pattern: str | None = None, max_size: int | None = None

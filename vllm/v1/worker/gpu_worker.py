@@ -870,6 +870,21 @@ class Worker(WorkerBase):
 
         return None
 
+    @torch.inference_mode()
+    def generate_latents_native_prefill(
+        self,
+        scheduler_output: "SchedulerOutput",
+        n_query: int,
+    ) -> torch.Tensor:
+        if self.parallel_config.pipeline_parallel_size > 1:
+            raise NotImplementedError(
+                "generate_latents_native_prefill does not yet support PP>1."
+            )
+        return self.model_runner.generate_latents_native_prefill(
+            scheduler_output=scheduler_output,
+            n_query=n_query,
+        )
+
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
 

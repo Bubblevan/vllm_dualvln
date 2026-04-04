@@ -6,7 +6,9 @@ from collections.abc import Mapping
 from typing import Any, Literal
 
 import vllm.envs as envs
+import torch
 from vllm.config import VllmConfig
+from vllm.debug_dump import append_log, dump_enabled, save_tensors
 from vllm.inputs.data import (
     ProcessorInputs,
     PromptType,
@@ -33,6 +35,98 @@ from vllm.utils.jsontree import json_iter_leaves
 from vllm.v1.engine import EngineCoreRequest
 
 logger = init_logger(__name__)
+
+
+def _summarize_mm_feature_data(data: Any) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "data_is_none": data is None,
+        "data_type": type(data).__name__ if data is not None else "NoneType",
+    }
+    if isinstance(data, Mapping):
+        try:
+            summary["mapping_keys"] = [str(key) for key in data.keys()]
+        except Exception:
+            summary["mapping_keys"] = None
+    elif isinstance(data, torch.Tensor):
+        summary["tensor_shape"] = list(data.shape)
+        summary["tensor_dtype"] = str(data.dtype)
+    return summary
+
+
+def _summarize_mm_feature(mm_feature: MultiModalFeatureSpec) -> dict[str, Any]:
+    position = mm_feature.mm_position
+    is_embed = getattr(position, "is_embed", None)
+    is_embed_true = None
+    is_embed_numel = None
+    if is_embed is not None:
+        is_embed_tensor = torch.as_tensor(is_embed, dtype=torch.bool).view(-1)
+        is_embed_true = int(is_embed_tensor.sum().item())
+        is_embed_numel = int(is_embed_tensor.numel())
+
+    return {
+        "modality": mm_feature.modality,
+        "identifier": getattr(mm_feature, "identifier", None),
+        "mm_hash": getattr(mm_feature, "mm_hash", None),
+        "offset": int(position.offset),
+        "length": int(position.length),
+        "is_embed_true": is_embed_true,
+        "is_embed_numel": is_embed_numel,
+        **_summarize_mm_feature_data(mm_feature.data),
+    }
+
+
+def _dump_engine_core_request(
+    *,
+    request_id: str,
+    processed_inputs: ProcessorInputs,
+    decoder_inputs: SingletonInputs,
+    supported_tasks: tuple[SupportedTask, ...],
+    params: SamplingParams | PoolingParams,
+    prompt_token_ids: list[int] | None,
+    prompt_embeds: torch.Tensor | None,
+    mm_features: list[MultiModalFeatureSpec] | None,
+) -> None:
+    if not dump_enabled():
+        return
+
+    mm_features_list = list(mm_features or [])
+    append_log(
+        "input_processor_engine_core_request",
+        {
+            "request_id": request_id,
+            "supported_tasks": list(supported_tasks),
+            "params_type": type(params).__name__,
+            "processed_inputs_type": processed_inputs.get("type"),
+            "decoder_inputs_type": decoder_inputs.get("type"),
+            "prompt_token_ids_len": (
+                len(prompt_token_ids) if prompt_token_ids is not None else None
+            ),
+            "has_prompt_embeds": prompt_embeds is not None,
+            "mm_feature_count": len(mm_features_list),
+            "mm_features": [
+                _summarize_mm_feature(mm_feature)
+                for mm_feature in mm_features_list
+            ],
+        },
+    )
+    prompt_token_ids_tensor = None
+    if prompt_token_ids is not None:
+        prompt_token_ids_tensor = torch.tensor(prompt_token_ids, dtype=torch.int64)
+    save_tensors(
+        "input_processor_engine_core_request",
+        {
+            "prompt_token_ids": prompt_token_ids_tensor,
+            "prompt_embeds": prompt_embeds,
+        },
+        meta={
+            "request_id": request_id,
+            "supported_tasks": list(supported_tasks),
+            "params_type": type(params).__name__,
+            "processed_inputs_type": processed_inputs.get("type"),
+            "decoder_inputs_type": decoder_inputs.get("type"),
+            "mm_feature_count": len(mm_features_list),
+        },
+    )
 
 
 class InputProcessor:
@@ -329,6 +423,17 @@ class InputProcessor:
                         mm_hash=base_mm_hash,
                     )
                 )
+
+        _dump_engine_core_request(
+            request_id=request_id,
+            processed_inputs=processed_inputs,
+            decoder_inputs=decoder_inputs,
+            supported_tasks=supported_tasks,
+            params=params,
+            prompt_token_ids=prompt_token_ids,
+            prompt_embeds=prompt_embeds,
+            mm_features=mm_features,
+        )
 
         return EngineCoreRequest(
             request_id=request_id,

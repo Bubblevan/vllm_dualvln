@@ -3434,6 +3434,216 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
+    def _cleanup_after_native_latent_prefill(self, req_id: str) -> None:
+        self.requests.pop(req_id, None)
+        self.num_prompt_logprobs.pop(req_id, None)
+        self.late_interaction_runner.on_requests_finished({req_id})
+
+        removed = self.input_batch.remove_request(req_id)
+        if removed is not None:
+            self.input_batch.condense()
+            self.input_batch.refresh_metadata()
+
+        self.input_batch.req_prompt_embeds.clear()
+        self.input_batch.prev_sampled_token_ids = None
+        self.input_batch.prev_req_id_to_index = None
+
+        if self.input_batch.num_reqs == 0:
+            self.input_batch.block_table.clear()
+
+    @torch.inference_mode()
+    def generate_latents_native_prefill(
+        self,
+        scheduler_output: "SchedulerOutput",
+        n_query: int,
+    ) -> torch.Tensor:
+        if self.execute_model_state is not None:
+            raise RuntimeError(
+                "State error: sample_tokens() must be called before "
+                "generate_latents_native_prefill()."
+            )
+        if self.requests or self.input_batch.num_reqs > 0:
+            raise RuntimeError(
+                "generate_latents_native_prefill requires an idle model runner."
+            )
+        if get_pp_group().world_size > 1:
+            raise NotImplementedError(
+                "generate_latents_native_prefill does not yet support PP>1."
+            )
+        if len(scheduler_output.scheduled_new_reqs) != 1:
+            raise ValueError(
+                "generate_latents_native_prefill expects exactly one new request."
+            )
+
+        req_id = scheduler_output.scheduled_new_reqs[0].req_id
+        try:
+            with (
+                record_function_or_nullcontext(
+                    "gpu_model_runner: latent_prefill_preprocess"
+                ),
+                self.synchronize_input_prep(),
+            ):
+                self._update_states(scheduler_output)
+
+                num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+                if num_scheduled_tokens <= 0:
+                    raise ValueError(
+                        "generate_latents_native_prefill requires scheduled tokens."
+                    )
+                if n_query > num_scheduled_tokens:
+                    raise ValueError(
+                        f"n_query {n_query} exceeds scheduled token count "
+                        f"{num_scheduled_tokens}."
+                    )
+
+                num_reqs = self.input_batch.num_reqs
+                req_ids = self.input_batch.req_ids
+                num_scheduled_tokens_np = np.array(
+                    [scheduler_output.num_scheduled_tokens[req_id] for req_id in req_ids],
+                    dtype=np.int32,
+                )
+                max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+
+                logits_indices, spec_decode_metadata = self._prepare_inputs(
+                    scheduler_output,
+                    num_scheduled_tokens_np,
+                )
+                if spec_decode_metadata is not None:
+                    raise RuntimeError(
+                        "Spec decode is not supported in native latent prefill."
+                    )
+
+                cascade_attn_prefix_lens = None
+                if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
+                    cascade_attn_prefix_lens = (
+                        self._compute_cascade_attn_prefix_lens(
+                            num_scheduled_tokens_np,
+                            self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                            scheduler_output.num_common_prefix_blocks,
+                        )
+                    )
+
+                (
+                    cudagraph_mode,
+                    batch_desc,
+                    should_ubatch,
+                    num_tokens_across_dp,
+                    _,
+                ) = self._determine_batch_execution_and_padding(
+                    num_tokens=num_scheduled_tokens,
+                    num_reqs=num_reqs,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    max_num_scheduled_tokens=max_num_scheduled_tokens,
+                    use_cascade_attn=cascade_attn_prefix_lens is not None,
+                    num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                )
+
+                num_tokens_padded = batch_desc.num_tokens
+                num_reqs_padded = (
+                    batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+                )
+                ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
+                    should_ubatch,
+                    num_scheduled_tokens_np,
+                    num_tokens_padded,
+                    num_reqs_padded,
+                    self.parallel_config.num_ubatches,
+                )
+
+                has_separate_kv_update = not all(
+                    all(
+                        g.backend.forward_includes_kv_cache_update
+                        for g in self.attn_groups[kv_cache_gid]
+                    )
+                    for kv_cache_gid, spec in enumerate(
+                        self.kv_cache_config.kv_cache_groups
+                    )
+                    if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
+                )
+                pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+                ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
+
+                slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                    num_tokens_padded=(
+                        num_tokens_padded
+                        if pad_attn or has_separate_kv_update
+                        else num_scheduled_tokens
+                    ),
+                    num_reqs_padded=(
+                        num_reqs_padded
+                        if pad_attn or has_separate_kv_update
+                        else num_reqs
+                    ),
+                    num_tokens_unpadded=num_scheduled_tokens,
+                    ubatch_slices=ubatch_slices_padded,
+                )
+
+                attn_metadata, _ = self._build_attention_metadata(
+                    num_tokens=num_scheduled_tokens,
+                    num_tokens_padded=num_tokens_padded if pad_attn else None,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded if pad_attn else None,
+                    max_query_len=max_num_scheduled_tokens,
+                    ubatch_slices=ubatch_slices_attn,
+                    logits_indices=logits_indices,
+                    use_spec_decode=False,
+                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                    slot_mappings=slot_mappings_by_group,
+                )
+
+                (
+                    input_ids,
+                    inputs_embeds,
+                    positions,
+                    intermediate_tensors,
+                    model_kwargs,
+                    _,
+                ) = self._preprocess(
+                    scheduler_output,
+                    num_tokens_padded,
+                    None,
+                )
+
+            with (
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    ubatch_slices=ubatch_slices_padded,
+                    slot_mapping=slot_mappings,
+                ),
+                record_function_or_nullcontext("gpu_model_runner: latent_prefill_forward"),
+                self.maybe_get_kv_connector_output(
+                    scheduler_output,
+                    defer_finalize=False,
+                ),
+            ):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+
+            hidden_states = (
+                model_output[0] if self.use_aux_hidden_state_outputs else model_output
+            )
+            if isinstance(hidden_states, IntermediateTensors):
+                raise RuntimeError(
+                    "Unexpected intermediate tensors in native latent prefill."
+                )
+
+            return hidden_states[
+                num_scheduled_tokens - n_query : num_scheduled_tokens
+            ].detach().cpu()
+        finally:
+            self._cleanup_after_native_latent_prefill(req_id)
+
     @staticmethod
     def _is_uniform_decode(
         max_num_scheduled_tokens: int,

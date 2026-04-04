@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from copy import copy
 from typing import Any
@@ -137,6 +138,9 @@ class LLMEngine:
 
         # Don't keep the dummy data in memory
         self.reset_mm_cache()
+        self._debug_recent_engine_core_requests: OrderedDict[
+            str, EngineCoreRequest
+        ] = OrderedDict()
 
     @classmethod
     def from_vllm_config(
@@ -213,6 +217,21 @@ class LLMEngine:
         request_ids = self.output_processor.abort_requests(request_ids, internal)
         self.engine_core.abort_requests(request_ids)
 
+    def _remember_debug_engine_core_request(self, request: EngineCoreRequest) -> None:
+        external_req_id = request.external_req_id
+        if external_req_id is None:
+            return
+
+        self._debug_recent_engine_core_requests[external_req_id] = copy(request)
+        self._debug_recent_engine_core_requests.move_to_end(external_req_id)
+        while len(self._debug_recent_engine_core_requests) > 32:
+            self._debug_recent_engine_core_requests.popitem(last=False)
+
+    def pop_debug_engine_core_request(
+        self, external_request_id: str
+    ) -> EngineCoreRequest | None:
+        return self._debug_recent_engine_core_requests.pop(external_request_id, None)
+
     def add_request(
         self,
         request_id: str,
@@ -259,6 +278,7 @@ class LLMEngine:
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
         self.input_processor.assign_request_id(request)
+        self._remember_debug_engine_core_request(request)
 
         req_id = request.request_id
 
@@ -423,6 +443,21 @@ class LLMEngine:
 
     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
         return self.collective_rpc("apply_model", args=(func,))
+
+    def generate_latents_native_prefill(
+        self,
+        *,
+        prompt_token_ids: list[int],
+        prompt_embeds,
+        mm_features,
+        n_query: int,
+    ) -> list[Any]:
+        return self.engine_core.generate_latents_native_prefill(
+            prompt_token_ids=prompt_token_ids,
+            prompt_embeds=prompt_embeds,
+            mm_features=mm_features,
+            n_query=n_query,
+        )
 
     def __del__(self):
         dp_group = getattr(self, "dp_group", None)

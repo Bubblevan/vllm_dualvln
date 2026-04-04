@@ -247,6 +247,7 @@ class ForwardContext:
 
 
 _forward_context: ForwardContext | None = None
+_last_debug_forward_context: ForwardContext | None = None
 
 
 def get_forward_context() -> ForwardContext:
@@ -256,6 +257,11 @@ def get_forward_context() -> ForwardContext:
         "Please use `set_forward_context` to set the forward context."
     )
     return _forward_context
+
+
+def get_last_debug_forward_context() -> ForwardContext | None:
+    """Return the most recently created forward context for debugging."""
+    return _last_debug_forward_context
 
 
 def is_forward_context_available() -> bool:
@@ -326,6 +332,7 @@ def set_forward_context(
     can be attention metadata, etc.
     Here we can inject common logic for every model forward pass.
     """
+    global _last_debug_forward_context
     global forward_start_time
     need_to_track_batchsize = track_batchsize and attn_metadata is not None
     if need_to_track_batchsize:
@@ -383,6 +390,7 @@ def set_forward_context(
         additional_kwargs,
         skip_compiled,
     )
+    _last_debug_forward_context = forward_context
 
     try:
         with override_forward_context(forward_context):

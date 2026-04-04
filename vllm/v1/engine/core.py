@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+import pickle
 import queue
 import signal
 import threading
@@ -15,6 +16,7 @@ from logging import DEBUG
 from typing import Any, TypeVar, cast
 
 import msgspec
+import torch
 import zmq
 
 import vllm.envs as envs
@@ -25,6 +27,7 @@ from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.sampling_params import SamplingParams
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
@@ -43,7 +46,11 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import (
+    CachedRequestData,
+    NewRequestData,
+    SchedulerOutput,
+)
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
     EEPNotificationType,
@@ -729,6 +736,108 @@ class EngineCore:
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
+
+    def generate_latents_native_prefill(
+        self,
+        prompt_token_ids: list[int],
+        prompt_embeds,
+        mm_features,
+        n_query: int,
+    ) -> list[Any]:
+        if self.scheduler.has_requests():
+            raise RuntimeError(
+                "generate_latents_native_prefill requires the engine to be idle."
+            )
+        if n_query <= 0:
+            raise ValueError(f"n_query must be positive, got {n_query}.")
+        if prompt_embeds is None:
+            raise ValueError("prompt_embeds is required for native latent prefill.")
+        if isinstance(prompt_embeds, (bytes, bytearray, memoryview)):
+            prompt_embeds = pickle.loads(bytes(prompt_embeds))
+        if isinstance(mm_features, (bytes, bytearray, memoryview)):
+            mm_features = pickle.loads(bytes(mm_features))
+        if not torch.is_tensor(prompt_embeds):
+            prompt_embeds = torch.tensor(
+                prompt_embeds,
+                dtype=self.vllm_config.model_config.dtype,
+            )
+        else:
+            prompt_embeds = prompt_embeds.detach().cpu()
+        mm_features = list(mm_features or [])
+        if self.mm_receiver_cache is not None and mm_features:
+            mm_features = self.mm_receiver_cache.get_and_update_features(mm_features)
+        if len(prompt_token_ids) == 0:
+            raise ValueError("prompt_token_ids must be non-empty.")
+        if prompt_embeds.ndim != 2:
+            raise ValueError(
+                "prompt_embeds must be rank-2, got "
+                f"shape={tuple(prompt_embeds.shape)}."
+            )
+        if int(prompt_embeds.shape[0]) != len(prompt_token_ids):
+            raise ValueError(
+                "prompt_embeds/token length mismatch: "
+                f"{int(prompt_embeds.shape[0])} != {len(prompt_token_ids)}."
+            )
+
+        request = Request(
+            request_id=f"latent_prefill_{time.time_ns()}",
+            prompt_token_ids=list(prompt_token_ids),
+            prompt_embeds=prompt_embeds.detach().cpu().contiguous(),
+            mm_features=mm_features,
+            sampling_params=SamplingParams(
+                max_tokens=1,
+                temperature=0.0,
+                skip_reading_prefix_cache=True,
+            ),
+            pooling_params=None,
+            arrival_time=time.time(),
+            block_hasher=None,
+        )
+
+        self.scheduler.kv_cache_manager.new_step_starts()
+        new_blocks = self.scheduler.kv_cache_manager.allocate_slots(
+            request,
+            num_new_tokens=request.num_tokens,
+            delay_cache_blocks=True,
+        )
+        if new_blocks is None:
+            raise RuntimeError(
+                "Failed to allocate KV cache blocks for native latent prefill."
+            )
+
+        new_block_ids_to_zero = (
+            (self.scheduler.kv_cache_manager.take_new_block_ids() or None)
+            if self.scheduler.needs_kv_cache_zeroing
+            else None
+        )
+        scheduler_output = SchedulerOutput(
+            scheduled_new_reqs=[
+                NewRequestData.from_request(
+                    request,
+                    new_blocks.get_block_ids(),
+                )
+            ],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_tokens={request.request_id: request.num_tokens},
+            total_num_scheduled_tokens=request.num_tokens,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[
+                0 for _ in self.scheduler.kv_cache_config.kv_cache_groups
+            ],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+            preempted_req_ids=set(),
+            new_block_ids_to_zero=new_block_ids_to_zero,
+        )
+
+        try:
+            return self.model_executor.collective_rpc(
+                "generate_latents_native_prefill",
+                args=(scheduler_output, n_query),
+            )
+        finally:
+            self.scheduler.kv_cache_manager.free(request)
 
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.
