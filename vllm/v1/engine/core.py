@@ -743,6 +743,7 @@ class EngineCore:
         prompt_embeds,
         mm_features,
         n_query: int,
+        prompt_embeds_soft_suffix_len: int | None = None,
     ) -> list[Any]:
         if self.scheduler.has_requests():
             raise RuntimeError(
@@ -771,16 +772,31 @@ class EngineCore:
                 "prompt_embeds must be rank-2, got "
                 f"shape={tuple(prompt_embeds.shape)}."
             )
-        if int(prompt_embeds.shape[0]) != len(prompt_token_ids):
+        if prompt_embeds_soft_suffix_len is None:
+            expected_prompt_embeds_len = len(prompt_token_ids)
+        else:
+            if prompt_embeds_soft_suffix_len <= 0:
+                raise ValueError(
+                    "prompt_embeds_soft_suffix_len must be positive, got "
+                    f"{prompt_embeds_soft_suffix_len}."
+                )
+            if prompt_embeds_soft_suffix_len > len(prompt_token_ids):
+                raise ValueError(
+                    "prompt_embeds_soft_suffix_len exceeds prompt length: "
+                    f"{prompt_embeds_soft_suffix_len} > {len(prompt_token_ids)}."
+                )
+            expected_prompt_embeds_len = prompt_embeds_soft_suffix_len
+        if int(prompt_embeds.shape[0]) != expected_prompt_embeds_len:
             raise ValueError(
                 "prompt_embeds/token length mismatch: "
-                f"{int(prompt_embeds.shape[0])} != {len(prompt_token_ids)}."
+                f"{int(prompt_embeds.shape[0])} != {expected_prompt_embeds_len}."
             )
 
         engine_request = EngineCoreRequest(
             request_id=f"latent_prefill_{time.time_ns()}",
             prompt_token_ids=list(prompt_token_ids),
             prompt_embeds=prompt_embeds.detach().cpu().contiguous(),
+            prompt_embeds_soft_suffix_len=prompt_embeds_soft_suffix_len,
             mm_features=mm_features,
             sampling_params=SamplingParams(
                 max_tokens=1,

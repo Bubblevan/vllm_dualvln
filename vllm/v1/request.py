@@ -28,6 +28,60 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 
+def get_num_prompt_tokens(
+    prompt_token_ids: list[int] | torch.Tensor | None,
+    prompt_embeds: torch.Tensor | None,
+    prompt_embeds_soft_suffix_len: int | None = None,
+) -> int:
+    prompt_token_len = None if prompt_token_ids is None else len(prompt_token_ids)
+    prompt_embeds_len = None if prompt_embeds is None else len(prompt_embeds)
+
+    if prompt_embeds_soft_suffix_len is None:
+        return length_from_prompt_token_ids_or_embeds(
+            prompt_token_ids,
+            prompt_embeds,
+        )
+
+    if prompt_embeds is None:
+        raise ValueError(
+            "prompt_embeds_soft_suffix_len requires prompt_embeds to be set."
+        )
+    if prompt_token_len is None:
+        raise ValueError(
+            "prompt_embeds_soft_suffix_len requires prompt_token_ids to be set."
+        )
+    if prompt_embeds_soft_suffix_len <= 0:
+        raise ValueError(
+            "prompt_embeds_soft_suffix_len must be positive, got "
+            f"{prompt_embeds_soft_suffix_len}."
+        )
+    if prompt_embeds_len != prompt_embeds_soft_suffix_len:
+        raise ValueError(
+            "prompt_embeds_soft_suffix_len/prompt_embeds length mismatch: "
+            f"{prompt_embeds_soft_suffix_len} != {prompt_embeds_len}."
+        )
+    if prompt_embeds_soft_suffix_len > prompt_token_len:
+        raise ValueError(
+            "prompt_embeds_soft_suffix_len exceeds prompt length: "
+            f"{prompt_embeds_soft_suffix_len} > {prompt_token_len}."
+        )
+    return prompt_token_len
+
+
+def get_prompt_embeds_range(
+    *,
+    num_prompt_tokens: int,
+    prompt_embeds: torch.Tensor | None,
+    prompt_embeds_soft_suffix_len: int | None = None,
+) -> tuple[int, int] | None:
+    if prompt_embeds is None:
+        return None
+    if prompt_embeds_soft_suffix_len is None:
+        return (0, num_prompt_tokens)
+    start = num_prompt_tokens - prompt_embeds_soft_suffix_len
+    return (start, num_prompt_tokens)
+
+
 @dataclass
 class StreamingUpdate:
     """Lightweight data for streaming session continuation.
@@ -65,6 +119,7 @@ class Request:
         client_index: int = 0,
         arrival_time: float | None = None,
         prompt_embeds: torch.Tensor | None = None,
+        prompt_embeds_soft_suffix_len: int | None = None,
         mm_features: list[MultiModalFeatureSpec] | None = None,
         lora_request: "LoRARequest | None" = None,
         cache_salt: str | None = None,
@@ -113,11 +168,14 @@ class Request:
 
         self.prompt_token_ids = prompt_token_ids
         self.prompt_embeds = prompt_embeds
+        self.prompt_embeds_soft_suffix_len = prompt_embeds_soft_suffix_len
         # Cache per-block prompt-embed hashes to avoid rehashing the same
         # tensor slices when generating extra keys.
         self._prompt_embeds_per_block_hashes: dict[tuple[int, int], bytes] = {}
-        self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
-            prompt_token_ids, prompt_embeds
+        self.num_prompt_tokens = get_num_prompt_tokens(
+            prompt_token_ids,
+            prompt_embeds,
+            prompt_embeds_soft_suffix_len,
         )
         self._output_token_ids: list[int] = []
         self._all_token_ids: list[int] = (
@@ -187,6 +245,7 @@ class Request:
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
             prompt_embeds=request.prompt_embeds,
+            prompt_embeds_soft_suffix_len=request.prompt_embeds_soft_suffix_len,
             mm_features=request.mm_features,
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,

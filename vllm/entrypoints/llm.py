@@ -684,6 +684,7 @@ class LLM:
         prompt_embeds,
         mm_features,
         n_query: int,
+        prompt_embeds_soft_suffix_len: int | None = None,
     ) -> list[torch.Tensor]:
         """
         Run a batch=1 native-context prefill on the current generate engine and
@@ -694,6 +695,7 @@ class LLM:
             prompt_embeds=prompt_embeds,
             mm_features=mm_features,
             n_query=n_query,
+            prompt_embeds_soft_suffix_len=prompt_embeds_soft_suffix_len,
         )
 
     def beam_search(

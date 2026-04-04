@@ -205,6 +205,7 @@ class EngineCoreClient(ABC):
         prompt_embeds,
         mm_features,
         n_query: int,
+        prompt_embeds_soft_suffix_len: int | None = None,
     ) -> list[Any]:
         raise NotImplementedError
 
@@ -375,12 +376,14 @@ class InprocClient(EngineCoreClient):
         prompt_embeds,
         mm_features,
         n_query: int,
+        prompt_embeds_soft_suffix_len: int | None = None,
     ) -> list[Any]:
         return self.engine_core.generate_latents_native_prefill(
             prompt_token_ids=prompt_token_ids,
             prompt_embeds=prompt_embeds,
             mm_features=mm_features,
             n_query=n_query,
+            prompt_embeds_soft_suffix_len=prompt_embeds_soft_suffix_len,
         )
 
     def dp_engines_running(self) -> bool:
@@ -733,6 +736,7 @@ class MPClient(EngineCoreClient):
         prompt_embeds,
         mm_features,
         n_query: int,
+        prompt_embeds_soft_suffix_len: int | None = None,
     ) -> list[Any]:
         raise NotImplementedError(
             "generate_latents_native_prefill is only available on the "
@@ -933,6 +937,7 @@ class SyncMPClient(MPClient):
         prompt_embeds,
         mm_features,
         n_query: int,
+        prompt_embeds_soft_suffix_len: int | None = None,
     ) -> list[Any]:
         if torch.is_tensor(prompt_embeds):
             prompt_embeds = pickle.dumps(
@@ -950,6 +955,7 @@ class SyncMPClient(MPClient):
             prompt_embeds,
             mm_features,
             n_query,
+            prompt_embeds_soft_suffix_len,
         )
 
     def save_sharded_state(

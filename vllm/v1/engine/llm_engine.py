@@ -451,12 +451,14 @@ class LLMEngine:
         prompt_embeds,
         mm_features,
         n_query: int,
+        prompt_embeds_soft_suffix_len: int | None = None,
     ) -> list[Any]:
         return self.engine_core.generate_latents_native_prefill(
             prompt_token_ids=prompt_token_ids,
             prompt_embeds=prompt_embeds,
             mm_features=mm_features,
             n_query=n_query,
+            prompt_embeds_soft_suffix_len=prompt_embeds_soft_suffix_len,
         )
 
     def __del__(self):

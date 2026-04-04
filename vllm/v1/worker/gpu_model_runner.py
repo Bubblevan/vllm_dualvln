@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -103,7 +104,6 @@ from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
-from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
@@ -156,6 +156,7 @@ from vllm.v1.outputs import (
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
+from vllm.v1.request import get_num_prompt_tokens, get_prompt_embeds_range
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -1159,6 +1160,9 @@ class GPUModelRunner(
                 req_id=req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
                 prompt_embeds=new_req_data.prompt_embeds,
+                prompt_embeds_soft_suffix_len=(
+                    new_req_data.prompt_embeds_soft_suffix_len
+                ),
                 mm_features=new_req_data.mm_features,
                 sampling_params=sampling_params,
                 pooling_params=pooling_params,
@@ -1439,13 +1443,18 @@ class GPUModelRunner(
         req_state.prompt_token_ids = new_req_data.prompt_token_ids
         req_state.mm_features = new_req_data.mm_features
         req_state.prompt_embeds = new_req_data.prompt_embeds
+        req_state.prompt_embeds_soft_suffix_len = (
+            new_req_data.prompt_embeds_soft_suffix_len
+        )
         req_state.sampling_params = new_req_data.sampling_params
         req_state.pooling_params = new_req_data.pooling_params
         self.late_interaction_runner.register_request(req_id, req_state.pooling_params)
         req_state.block_ids = new_req_data.block_ids
         req_state.num_computed_tokens = new_req_data.num_computed_tokens
-        req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
-            req_state.prompt_token_ids, req_state.prompt_embeds
+        req_state.num_prompt_tokens = get_num_prompt_tokens(
+            req_state.prompt_token_ids,
+            req_state.prompt_embeds,
+            req_state.prompt_embeds_soft_suffix_len,
         )
 
         # Clear `output_token_ids` as previous output tokens are now part of
@@ -1553,11 +1562,14 @@ class GPUModelRunner(
         Carefully handles the `prev_sampled_token_ids` which can be cached
         from the previous engine iteration, in which case those tokens on the
         GPU need to be copied into the corresponding slots into input_ids."""
+        runtime_prompt_embeds_enabled = (
+            self.enable_prompt_embeds or bool(self.input_batch.req_prompt_embeds)
+        )
 
         if self.input_batch.prev_sampled_token_ids is None:
             # Normal scheduling case
             self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
-            if self.enable_prompt_embeds:
+            if runtime_prompt_embeds_enabled:
                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
                 self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
             return
@@ -1607,7 +1619,7 @@ class GPUModelRunner(
             # If not all requests are decodes from the last iteration,
             # We need to copy the input_ids_cpu to the GPU first.
             self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
-            if self.enable_prompt_embeds:
+            if runtime_prompt_embeds_enabled:
                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
                 self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
         if num_common_tokens == 0:
@@ -1623,7 +1635,7 @@ class GPUModelRunner(
                 self.input_batch.prev_sampled_token_ids[:num_common_tokens, 0],
                 non_blocking=True,
             )
-            if self.enable_prompt_embeds:
+            if runtime_prompt_embeds_enabled:
                 self.is_token_ids.gpu[:num_common_tokens] = True
             return
         # Upload the index tensors asynchronously so the scatter can be non-blocking.
@@ -1725,6 +1737,9 @@ class GPUModelRunner(
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
+        runtime_prompt_embeds_enabled = (
+            self.enable_prompt_embeds or bool(self.input_batch.req_prompt_embeds)
+        )
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -1774,7 +1789,7 @@ class GPUModelRunner(
             token_indices_tensor,
             out=self.input_ids.cpu[:total_num_scheduled_tokens],
         )
-        if self.enable_prompt_embeds:
+        if runtime_prompt_embeds_enabled:
             is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
             torch.index_select(
                 is_token_ids,
@@ -1803,21 +1818,80 @@ class GPUModelRunner(
 
                 req_embeds = self.input_batch.req_prompt_embeds[req_idx]
                 start_pos = self.input_batch.num_computed_tokens_cpu[req_idx]
+                prompt_len = int(self.input_batch.num_prompt_tokens[req_idx])
+                soft_suffix_len = self.input_batch.req_prompt_embeds_soft_suffix_lens.get(
+                    req_idx
+                )
+                prompt_embeds_range = get_prompt_embeds_range(
+                    num_prompt_tokens=prompt_len,
+                    prompt_embeds=req_embeds,
+                    prompt_embeds_soft_suffix_len=soft_suffix_len,
+                )
+                assert prompt_embeds_range is not None
+                prompt_embeds_start, prompt_embeds_end = prompt_embeds_range
 
-                # Skip if trying to read beyond available embeddings
-                if start_pos >= req_embeds.shape[0]:
+                sched_start = int(start_pos)
+                sched_end = sched_start + int(num_sched)
+                overlap_start = max(sched_start, prompt_embeds_start)
+                overlap_end = min(sched_end, prompt_embeds_end)
+
+                if overlap_start >= overlap_end:
                     output_idx += num_sched
                     continue
 
-                # Copy available embeddings
-                end_pos = start_pos + num_sched
-                actual_end = min(end_pos, req_embeds.shape[0])
-                actual_num_sched = actual_end - start_pos
+                src_start = overlap_start - prompt_embeds_start
+                src_end = overlap_end - prompt_embeds_start
+                dst_start = output_idx + (overlap_start - sched_start)
+                dst_end = dst_start + (overlap_end - overlap_start)
+                self.inputs_embeds.cpu[dst_start:dst_end].copy_(
+                    req_embeds[src_start:src_end]
+                )
 
-                if actual_num_sched > 0:
-                    self.inputs_embeds.cpu[
-                        output_idx : output_idx + actual_num_sched
-                    ].copy_(req_embeds[start_pos:actual_end])
+                if os.environ.get("INTERNNAV_DEBUG_PROMPT_EMBEDS", "0") == "1":
+                    false_indices = torch.nonzero(
+                        ~self.is_token_ids.cpu[output_idx : output_idx + num_sched],
+                        as_tuple=False,
+                    ).squeeze(1)
+                    false_indices_list = (
+                        false_indices.detach().cpu().tolist()
+                        if false_indices.numel() > 0
+                        else []
+                    )
+                    expected_false_indices = list(
+                        range(overlap_start - sched_start, overlap_end - sched_start)
+                    )
+                    append_log(
+                        "gpu_model_runner_prompt_embeds_debug",
+                        {
+                            "req_id": self.input_batch.req_ids[req_idx],
+                            "req_index": int(req_idx),
+                            "prompt_len": int(prompt_len),
+                            "soft_suffix_len": (
+                                int(soft_suffix_len)
+                                if soft_suffix_len is not None
+                                else None
+                            ),
+                            "num_scheduled_tokens": int(num_sched),
+                            "scheduled_prompt_start": int(sched_start),
+                            "scheduled_prompt_end": int(sched_end),
+                            "num_false_scheduled_entries": int(
+                                len(false_indices_list)
+                            ),
+                            "false_scheduled_indices": false_indices_list,
+                            "false_scheduled_exact_override": (
+                                false_indices_list == expected_false_indices
+                            ),
+                            "scheduled_prompt_override_positions": list(
+                                range(overlap_start, overlap_end)
+                            ),
+                            "req_prompt_embeds_shape": list(req_embeds.shape),
+                            "req_prompt_embeds_storage": (
+                                "suffix_only"
+                                if soft_suffix_len is not None
+                                else "full_prompt"
+                            ),
+                        },
+                    )
 
                 output_idx += num_sched
 
@@ -2318,8 +2392,10 @@ class GPUModelRunner(
 
             num_computed_tokens = self.input_batch.num_computed_tokens_cpu[index]
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
-                req.prompt_token_ids, req.prompt_embeds
+            num_prompt_tokens = get_num_prompt_tokens(
+                req.prompt_token_ids,
+                req.prompt_embeds,
+                req.prompt_embeds_soft_suffix_len,
             )
 
             if num_computed_tokens + num_scheduled_tokens > num_prompt_tokens:
@@ -2367,8 +2443,10 @@ class GPUModelRunner(
 
             num_computed_tokens = self.input_batch.num_computed_tokens_cpu[index]
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
-                req.prompt_token_ids, req.prompt_embeds
+            num_prompt_tokens = get_num_prompt_tokens(
+                req.prompt_token_ids,
+                req.prompt_embeds,
+                req.prompt_embeds_soft_suffix_len,
             )
 
             if num_computed_tokens + num_scheduled_tokens > num_prompt_tokens:
@@ -3086,6 +3164,9 @@ class GPUModelRunner(
         ECConnectorOutput | None,
     ]:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        runtime_prompt_embeds_enabled = (
+            self.enable_prompt_embeds or bool(self.input_batch.req_prompt_embeds)
+        )
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
 
@@ -3104,7 +3185,7 @@ class GPUModelRunner(
 
             preserved_prompt_embeds = None
             preserved_prompt_mask = None
-            if self.enable_prompt_embeds and self.input_batch.req_prompt_embeds:
+            if runtime_prompt_embeds_enabled and self.input_batch.req_prompt_embeds:
                 preserved_prompt_mask = ~self.is_token_ids.gpu[:num_scheduled_tokens]
                 if preserved_prompt_mask.any():
                     preserved_prompt_embeds = self.inputs_embeds.gpu[
@@ -3132,7 +3213,7 @@ class GPUModelRunner(
                 **self._init_model_kwargs(),
                 **self._extract_mm_kwargs(scheduler_output),
             }
-        elif self.enable_prompt_embeds and is_first_rank:
+        elif runtime_prompt_embeds_enabled and is_first_rank:
             # Get the input embeddings for the tokens that are not input embeds,
             # then put them into the appropriate positions.
             # TODO(qthequartermasterman): Since even when prompt embeds are
@@ -3201,12 +3282,12 @@ class GPUModelRunner(
                     "positions_gpu": positions,
                     "is_token_ids_gpu": (
                         self.is_token_ids.gpu[:num_input_tokens]
-                        if self.enable_prompt_embeds
+                        if runtime_prompt_embeds_enabled
                         else None
                     ),
                     "inputs_embeds_gpu": (
                         self.inputs_embeds.gpu[:num_input_tokens]
-                        if self.enable_prompt_embeds
+                        if runtime_prompt_embeds_enabled
                         else None
                     ),
                 },
@@ -3218,6 +3299,9 @@ class GPUModelRunner(
                     "uses_mrope": bool(self.uses_mrope),
                     "supports_mm_inputs": bool(self.supports_mm_inputs),
                     "enable_prompt_embeds": bool(self.enable_prompt_embeds),
+                    "runtime_prompt_embeds_enabled": bool(
+                        runtime_prompt_embeds_enabled
+                    ),
                 },
             )
 
@@ -3445,6 +3529,7 @@ class GPUModelRunner(
             self.input_batch.refresh_metadata()
 
         self.input_batch.req_prompt_embeds.clear()
+        self.input_batch.req_prompt_embeds_soft_suffix_lens.clear()
         self.input_batch.prev_sampled_token_ids = None
         self.input_batch.prev_req_id_to_index = None
 

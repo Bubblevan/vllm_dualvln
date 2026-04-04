@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Datastructures defining a GPU input batch
 
+import os
 from dataclasses import dataclass
 from typing import cast
 
@@ -13,10 +14,10 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
-from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.collection_utils import swap_dict_values
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
+from vllm.v1.request import get_num_prompt_tokens, get_prompt_embeds_range
 from vllm.v1.sample.logits_processor import (
     BatchUpdateBuilder,
     LogitsProcessors,
@@ -46,6 +47,7 @@ class CachedRequestState:
 
     lora_request: LoRARequest | None = None
     prompt_embeds: torch.Tensor | None = None
+    prompt_embeds_soft_suffix_len: int | None = None
 
     # Used when both async_scheduling and spec_decode are enabled.
     prev_num_draft_len: int = 0
@@ -55,8 +57,10 @@ class CachedRequestState:
     pooling_states: PoolingStates | None = None
 
     def __post_init__(self):
-        self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
-            self.prompt_token_ids, self.prompt_embeds
+        self.num_prompt_tokens = get_num_prompt_tokens(
+            self.prompt_token_ids,
+            self.prompt_embeds,
+            self.prompt_embeds_soft_suffix_len,
         )
 
         if self.pooling_params is not None:
@@ -128,6 +132,7 @@ class InputBatch:
         # allocation if max_model_len is big.
         # Maps req_index -> tensor of shape (num_prompt_tokens, hidden_size)
         self.req_prompt_embeds: dict[int, torch.Tensor] = {}
+        self.req_prompt_embeds_soft_suffix_lens: dict[int, int] = {}
         self.num_tokens_no_spec_cpu_tensor = torch.zeros(
             (max_num_reqs,),
             device="cpu",
@@ -327,26 +332,69 @@ class InputBatch:
         self.req_id_to_index[req_id] = req_index
 
         # Copy the prompt token ids and output token ids.
-        num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
-            request.prompt_token_ids, request.prompt_embeds
+        num_prompt_tokens = get_num_prompt_tokens(
+            request.prompt_token_ids,
+            request.prompt_embeds,
+            request.prompt_embeds_soft_suffix_len,
         )
         self.num_prompt_tokens[req_index] = num_prompt_tokens
         start_idx = num_prompt_tokens
         end_idx = start_idx + len(request.output_token_ids)
         if request.prompt_token_ids is not None:
             self.token_ids_cpu[req_index, :num_prompt_tokens] = request.prompt_token_ids
-        # If prompt_embeds are provided for the prompt segment, preserve the
-        # token ids for metadata / position construction, but do not mark these
-        # positions as token-id-backed inputs. Otherwise the worker will
-        # re-embed them and overwrite the supplied prompt embeddings.
+        self.is_token_ids[req_index, :num_prompt_tokens] = (
+            request.prompt_token_ids is not None
+        )
         if request.prompt_embeds is not None:
-            self.is_token_ids[req_index, :num_prompt_tokens] = False
-        else:
-            self.is_token_ids[req_index, :num_prompt_tokens] = (
-                request.prompt_token_ids is not None
+            prompt_embeds_range = get_prompt_embeds_range(
+                num_prompt_tokens=num_prompt_tokens,
+                prompt_embeds=request.prompt_embeds,
+                prompt_embeds_soft_suffix_len=request.prompt_embeds_soft_suffix_len,
             )
-        if request.prompt_embeds is not None:
+            assert prompt_embeds_range is not None
+            prompt_embeds_start, prompt_embeds_end = prompt_embeds_range
+            self.is_token_ids[req_index, prompt_embeds_start:prompt_embeds_end] = False
             self.req_prompt_embeds[req_index] = request.prompt_embeds
+            if request.prompt_embeds_soft_suffix_len is not None:
+                self.req_prompt_embeds_soft_suffix_lens[req_index] = (
+                    request.prompt_embeds_soft_suffix_len
+                )
+            else:
+                self.req_prompt_embeds_soft_suffix_lens.pop(req_index, None)
+            if os.environ.get("INTERNNAV_DEBUG_PROMPT_EMBEDS", "0") == "1":
+                false_indices = np.flatnonzero(
+                    ~self.is_token_ids[req_index, :num_prompt_tokens]
+                ).tolist()
+                expected_false_indices = list(
+                    range(prompt_embeds_start, prompt_embeds_end)
+                )
+                append_log(
+                    "gpu_input_batch_prompt_embeds_debug",
+                    {
+                        "req_id": req_id,
+                        "req_index": int(req_index),
+                        "prompt_len": int(num_prompt_tokens),
+                        "soft_suffix_len": (
+                            int(request.prompt_embeds_soft_suffix_len)
+                            if request.prompt_embeds_soft_suffix_len is not None
+                            else None
+                        ),
+                        "num_false_prompt_entries": int(len(false_indices)),
+                        "false_prompt_indices": false_indices,
+                        "false_prompt_exact_suffix": (
+                            false_indices == expected_false_indices
+                        ),
+                        "req_prompt_embeds_shape": list(request.prompt_embeds.shape),
+                        "req_prompt_embeds_storage": (
+                            "suffix_only"
+                            if request.prompt_embeds_soft_suffix_len is not None
+                            else "full_prompt"
+                        ),
+                    },
+                )
+        else:
+            self.req_prompt_embeds.pop(req_index, None)
+            self.req_prompt_embeds_soft_suffix_lens.pop(req_index, None)
         self.token_ids_cpu[req_index, start_idx:end_idx] = request.output_token_ids
         self.is_token_ids[req_index, start_idx:end_idx] = True
         # Number of tokens without spec decode tokens.
@@ -619,6 +667,16 @@ class InputBatch:
             self.req_prompt_embeds[i1] = embeds_i2
         else:
             self.req_prompt_embeds.pop(i1, None)
+        suffix_len_i1 = self.req_prompt_embeds_soft_suffix_lens.get(i1)
+        suffix_len_i2 = self.req_prompt_embeds_soft_suffix_lens.get(i2)
+        if suffix_len_i1 is not None:
+            self.req_prompt_embeds_soft_suffix_lens[i2] = suffix_len_i1
+        else:
+            self.req_prompt_embeds_soft_suffix_lens.pop(i2, None)
+        if suffix_len_i2 is not None:
+            self.req_prompt_embeds_soft_suffix_lens[i1] = suffix_len_i2
+        else:
+            self.req_prompt_embeds_soft_suffix_lens.pop(i1, None)
 
         self.block_table.swap_row(i1, i2)
 
@@ -691,6 +749,7 @@ class InputBatch:
             self._req_ids.clear()
             self.req_output_token_ids.clear()
             self.spec_token_ids.clear()
+            self.req_prompt_embeds_soft_suffix_lens.clear()
             return
 
         # NOTE(woosuk): This function assumes that the empty_req_indices
@@ -738,6 +797,10 @@ class InputBatch:
             if last_req_index in self.req_prompt_embeds:
                 self.req_prompt_embeds[empty_index] = self.req_prompt_embeds.pop(
                     last_req_index
+                )
+            if last_req_index in self.req_prompt_embeds_soft_suffix_lens:
+                self.req_prompt_embeds_soft_suffix_lens[empty_index] = (
+                    self.req_prompt_embeds_soft_suffix_lens.pop(last_req_index)
                 )
             self.num_tokens_no_spec[empty_index] = self.num_tokens_no_spec[
                 last_req_index
